@@ -263,11 +263,7 @@ def minimize(engine, config, positions=None):
 
 
 def get_total_energy(engine, positions=None):
-    if positions is not None:
-        set_positions(engine=engine, positions=positions)
-    # Get total energy
-    engine.command("run 0")
-    result = engine.lmp.get_thermo("etotal")
+    result = get_potential_energy(engine, positions=positions)
     if engine.rank == 0:
         return result
 
@@ -275,11 +271,8 @@ def get_total_energy(engine, positions=None):
 def get_potential_energy(engine, positions=None):
     if positions is not None:
         set_positions(engine=engine, positions=positions)
-    # get potential energy
-    engine.command("compute c1 all pe")
     engine.command("run 0")
-    result = engine.lmp.extract_compute("c1", 0, 0)
-    engine.command("uncompute c1")
+    result = engine.lmp.get_thermo("pe")
     return result
 
 
