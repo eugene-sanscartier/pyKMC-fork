@@ -808,6 +808,18 @@ class KMC:
         else:
             self.loggers.error("log", "All event reconstuctions failed.")
             self._close()
+
+        # TEMPORARY FIX (proper fix deferred to a later pull request): the
+        # executed event proves its reference is valid, but a sibling instance
+        # (same reference, different atom) may have failed earlier and landed in
+        # err_reference, causing run() to purge a reference the selected event
+        # just used. We filter it out here (err_reference/err_ae are parallel).
+        if result_reconstruction.is_ok():
+            num_ref_selected = active_table.table.loc[idx_selected_event].at["num_reference_event"]
+            kept = [(r, ae) for r, ae in zip(err_reference, err_ae) if r != num_ref_selected]
+            err_reference = [r for r, _ in kept]
+            err_ae = [ae for _, ae in kept]
+
         return (
             result_reconstruction,
             delta_t,
