@@ -453,8 +453,27 @@ def partn_search(
         artn.set("forc_thr", config.partn.forc_thr)
         artn.set("push_over", config.partn.push_over)
         engine.command(f"minimize 1e-6 1e-8 10000 {config.partn.nevalf_max}")
-    except Exception:
-        raise
+    except RuntimeError as exc:
+        recovery_error = None
+        try:
+            _reset_engine_state(engine, config, positions, cell, types)
+        except Exception as recovery_exc:
+            recovery_error = recovery_exc
+
+        details = str(exc)
+        if recovery_error is not None:
+            details = (
+                f"{details}; recovery failed with "
+                f"{type(recovery_error).__name__}: {recovery_error}"
+            )
+        return Err(
+            ErrorInfo(
+                type=ErrorType.EVENT_SEARCH_RUNTIME_ERROR,
+                message="Runtime error during event search.",
+                details=details,
+                variables={"central_atom_index": central_atom_idx},
+            )
+        )
 
     engine.command("unfix 10")
     _remove_frozen_fix(engine, "f_frozen_post", atoms_frozen)
@@ -747,5 +766,28 @@ def partn_refine(
                     )
                 )
             return None
-    except Exception:
-        raise
+    except RuntimeError as exc:
+        recovery_error = None
+        try:
+            _reset_engine_state(engine, config, positions, cell, types)
+        except Exception as recovery_exc:
+            recovery_error = recovery_exc
+
+        details = str(exc)
+        if recovery_error is not None:
+            details = (
+                f"{details}; recovery failed with "
+                f"{type(recovery_error).__name__}: {recovery_error}"
+            )
+        return Err(
+            ErrorInfo(
+                type=ErrorType.EVENT_REFINEMENT_RUNTIME_ERROR,
+                message="Runtime error during event refinement.",
+                details=details,
+                variables={
+                    "central_atom_index": central_atom_idx,
+                    "num_reference_event": num_reference_event,
+                    "symmetry_index": symmetry_index,
+                },
+            )
+        )
