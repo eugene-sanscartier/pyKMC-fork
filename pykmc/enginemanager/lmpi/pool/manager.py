@@ -255,8 +255,30 @@ class Manager:
         # print("[PoolManager] Closing all sessions.")
         # global_session shares its master rank with self.sessions[0] (see ManagerFactory),
         # so closing it separately races with that session's close over the same rank.
+        self._stop_workers()
         for session in self.sessions:
             session.close(wait_status=True)
+
+    def _stop_workers(self):
+        """Discard queued jobs and stop worker threads before touching sessions directly.
+
+        Otherwise a worker thread can still be mid-flight on a session (or pick up a
+        leftover queued job) while close_all() closes that same session, either racing
+        it over the shared MPI channel or blocking forever sending to a rank that has
+        already exited its engine loop.
+        """
+        while True:
+            try:
+                job = self.job_queue.get_nowait()
+            except queue.Empty:
+                break
+            job.future.set_exception(RuntimeError("Manager is closing; job discarded."))
+            self.job_queue.task_done()
+
+        for _ in self.workers:
+            self.job_queue.put(None)
+        for worker in self.workers:
+            worker.join()
 
     def __getattr__(self, name: str):
         """Check if method start with global_, if yes, then return global_session.method"""
