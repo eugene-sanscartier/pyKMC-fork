@@ -914,6 +914,14 @@ class BiasConfig(BaseModel):
             "is active and a direction vector must be provided."
         ),
     )
+    thr_boost: Optional[float] = Field(
+        default=None,
+        description=(
+            "Only used in boost mode. Desired events whose barrier (dE_forward) exceeds "
+            "thr_boost are excluded from the boost: their rate is left unmodified instead "
+            "of being multiplied by alpha. None (default) disables this cutoff."
+        ),
+    )
 
     @field_validator("direction", "target_point", mode="before")
     @classmethod

@@ -49,6 +49,11 @@ class Bias(ABC):
         ``atom_indices`` whitelist.  ``False`` (default) treats non-listed
         atoms as rejected/undesired.  ``True`` lets them pass unconditionally;
         only valid in ``"filter"`` mode when ``atom_indices`` is also set.
+    thr_boost : float or None, optional
+        Only used in ``"boost"`` mode.  Desired events whose barrier
+        (``dE_forward``) exceeds ``thr_boost`` are excluded from the boost:
+        their rate is left unmodified instead of being multiplied by α.
+        ``None`` (default) disables this cutoff.
     """
 
     def __init__(
@@ -57,6 +62,7 @@ class Bias(ABC):
         bias_weight: float = 0.5,
         pass_unlisted: bool = False,
         require_central: bool = False,
+        thr_boost: float | None = None,
     ) -> None:
         if mode == "boost" and pass_unlisted:
             raise ValueError(
@@ -69,6 +75,7 @@ class Bias(ABC):
         self.bias_weight = bias_weight
         self.pass_unlisted = pass_unlisted
         self.require_central = require_central
+        self.thr_boost = thr_boost
         self.current_step = 0
         self._step_is_active = True
 
@@ -255,6 +262,10 @@ class Bias(ABC):
         desired_mask = np.array(
             [
                 self.accept(row, system, reference_table, neighbors_list)
+                and (
+                    self.thr_boost is None
+                    or float(row.get("dE_forward", float("inf"))) <= self.thr_boost
+                )
                 for _, row in active_table.table.iterrows()
             ]
         )
@@ -382,6 +393,9 @@ class DirectionBias(Bias):
     step_interval : int or None, optional
         Apply the bias only every ``step_interval`` KMC steps. ``None`` or ``1``
         means the bias is active at every step.
+    thr_boost : float or None, optional
+        Only used in ``"boost"`` mode.  Desired events whose barrier exceeds
+        this threshold are excluded from the boost.  Default is ``None``.
     """
 
     def __init__(
@@ -394,12 +408,14 @@ class DirectionBias(Bias):
         pass_unlisted: bool = False,
         require_central: bool = False,
         step_interval: int | None = None,
+        thr_boost: float | None = None,
     ) -> None:
         super().__init__(
             mode=mode,
             bias_weight=bias_weight,
             pass_unlisted=pass_unlisted,
             require_central=require_central,
+            thr_boost=thr_boost,
         )
         d = np.asarray(direction, dtype=float)
         self._direction = d / np.linalg.norm(d)
@@ -489,6 +505,9 @@ class PointBias(Bias):
         ``atom_indices``, ``pass_unlisted`` is returned.  When False
         (default), the condition is satisfied by any atom in ``atom_indices``
         found in the event neighbourhood.
+    thr_boost : float or None, optional
+        Only used in ``"boost"`` mode.  Desired events whose barrier exceeds
+        this threshold are excluded from the boost.  Default is ``None``.
     """
 
     def __init__(
@@ -500,12 +519,14 @@ class PointBias(Bias):
         bias_weight: float = 0.5,
         pass_unlisted: bool = False,
         require_central: bool = False,
+        thr_boost: float | None = None,
     ) -> None:
         super().__init__(
             mode=mode,
             bias_weight=bias_weight,
             pass_unlisted=pass_unlisted,
             require_central=require_central,
+            thr_boost=thr_boost,
         )
         self._target = np.asarray(target_point, dtype=float)
         self._atom_set = set(atom_indices) if atom_indices is not None else None
@@ -589,6 +610,9 @@ class TopoBias(Bias):
     pass_unlisted : bool
         Return value of :meth:`accept` for non-source atoms.  Default is
         ``False``.  Setting ``True`` is only valid in ``"filter"`` mode.
+    thr_boost : float or None, optional
+        Only used in ``"boost"`` mode.  Desired events whose barrier exceeds
+        this threshold are excluded from the boost.  Default is ``None``.
     """
 
     def __init__(
@@ -601,9 +625,13 @@ class TopoBias(Bias):
         mode: Literal["filter", "boost"] = "filter",
         bias_weight: float = 0.5,
         pass_unlisted: bool = False,
+        thr_boost: float | None = None,
     ) -> None:
         super().__init__(
-            mode=mode, bias_weight=bias_weight, pass_unlisted=pass_unlisted
+            mode=mode,
+            bias_weight=bias_weight,
+            pass_unlisted=pass_unlisted,
+            thr_boost=thr_boost,
         )
         self._topo_source = atomic_environment.atomic_environment_list[atom_source_idx]
         self._topo_target = (

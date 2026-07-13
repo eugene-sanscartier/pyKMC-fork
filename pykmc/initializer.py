@@ -128,6 +128,7 @@ class Initializer:
                     pass_unlisted=bc.pass_unlisted,
                     require_central=bc.require_central,
                     step_interval=bc.step_interval,
+                    thr_boost=bc.thr_boost,
                 )
             case "point":
                 self.kmc.bias = PointBias(
@@ -138,6 +139,7 @@ class Initializer:
                     bias_weight=bc.bias_weight,
                     pass_unlisted=bc.pass_unlisted,
                     require_central=bc.require_central,
+                    thr_boost=bc.thr_boost,
                 )
             case "topo":
                 self.kmc.bias = TopoBias(
@@ -149,6 +151,7 @@ class Initializer:
                     mode=bc.mode,
                     bias_weight=bc.bias_weight,
                     pass_unlisted=bc.pass_unlisted,
+                    thr_boost=bc.thr_boost,
                 )
 
     def _initialize_visited_environments(self) -> None:
