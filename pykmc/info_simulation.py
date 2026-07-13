@@ -236,22 +236,25 @@ def info_active_events(system_types, reference_table, active_table) -> EventsInf
 
     dE_asym = np.abs(dE_forward - dE_backward)
 
+    # Keep only one row per (central_atom, reference_event) pair for logging, dropping symmetry-equivalent copies
+    keep = (~pd.DataFrame({"c": central_atom, "r": reference_events}).duplicated(keep="first")).to_numpy()
+
     return EventsInfo(
-        types=types,
-        central_atom=central_atom,
-        initial_topologies=initial_topologies,
-        reference_events=reference_events,
-        dE_forward=dE_forward,
-        dE_backward=dE_backward,
-        dE_asym=dE_asym,
-        k=k,
-        dra_i=dra_i,
-        dra_f=dra_f,
-        refined=refined,
-        event_id=event_ids,
-        id_initial=initial_topologies,
-        id_saddle=id_saddles,
-        id_final=id_finals,
+        types=types[keep],
+        central_atom=central_atom[keep],
+        initial_topologies=initial_topologies[keep],
+        reference_events=reference_events[keep],
+        dE_forward=dE_forward[keep],
+        dE_backward=dE_backward[keep],
+        dE_asym=dE_asym[keep],
+        k=k[keep],
+        dra_i=dra_i[keep],
+        dra_f=dra_f[keep],
+        refined=refined[keep],
+        event_id=event_ids[keep],
+        id_initial=initial_topologies[keep],
+        id_saddle=id_saddles[keep],
+        id_final=id_finals[keep],
     )
 
 
