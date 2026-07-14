@@ -280,21 +280,29 @@ class KMC:
                 err_reference,
                 err_ae,
             ) = self.reconstruction(active_table)
+            num_ref_selected = active_table.table.loc[idx_selected_event].at[
+                "num_reference_event"
+            ]
             events_info = info_active_events(
                 self.system.types, self.reference_table, active_table
             )
             if len(err_reference) != 0:
+                selected_topo = self.reference_table.table[
+                    self.reference_table.table["idx_ref"] == num_ref_selected
+                ]["id_initial"].values[0]
                 self.loggers.info(
                     "log",
                     "\t :=> Removing reference event from which reconstruction failed.",
                 )
-                self.reference_table.remove(list(set(err_reference)))
+                self.reference_table.remove(
+                    list(set(err_reference)), protect={num_ref_selected}
+                )
                 self.loggers.info(
                     "log",
                     "\t :=> Removing topology from known environments from which reconstruction failed.",
                 )
                 self.visited_environments = self.visited_environments.difference(
-                    set(err_ae)
+                    set(err_ae) - {selected_topo}
                 )
             # INFO :
             self.loggers.events_file_step_first_line("events", step)
@@ -437,9 +445,6 @@ class KMC:
             elapsed_real = time.time() - start_real
             elapsed_cpu = time.process_time() - start_cpu
 
-            num_ref_selected = active_table.table.loc[idx_selected_event].at[
-                "num_reference_event"
-            ]
             event_id_selected = fmt_hash(
                 self.reference_table.table[
                     self.reference_table.table["idx_ref"] == num_ref_selected
@@ -471,6 +476,7 @@ class KMC:
                     idx_selected_event,
                     self.system,
                     self._pre_exec_positions,
+                    self.reference_table,
                 )
                 self.active_table.recycler = saved_recycler
             else:
@@ -478,6 +484,7 @@ class KMC:
                     idx_selected_event,
                     self.system,
                     self._pre_exec_positions,
+                    self.reference_table,
                 )
                 if self.config.control.recycle:
                     self.loggers.info(
@@ -808,17 +815,6 @@ class KMC:
         else:
             self.loggers.error("log", "All event reconstuctions failed.")
             self._close()
-
-        # TEMPORARY FIX (proper fix deferred to a later pull request): the
-        # executed event proves its reference is valid, but a sibling instance
-        # (same reference, different atom) may have failed earlier and landed in
-        # err_reference, causing run() to purge a reference the selected event
-        # just used. We filter it out here (err_reference/err_ae are parallel).
-        if result_reconstruction.is_ok():
-            num_ref_selected = active_table.table.loc[idx_selected_event].at["num_reference_event"]
-            kept = [(r, ae) for r, ae in zip(err_reference, err_ae) if r != num_ref_selected]
-            err_reference = [r for r, _ in kept]
-            err_ae = [ae for _, ae in kept]
 
         return (
             result_reconstruction,

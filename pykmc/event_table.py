@@ -618,13 +618,15 @@ class ReferenceEventTable:
                 }
             )
 
-    def remove(self, idx_refs: list[int]) -> None:
+    def remove(self, idx_refs: list[int], protect: set[int] | None = None) -> None:
         """Remove events with ind == idx_ref as well as its backward event
 
         Parameters
         ----------
         ind : int
             index of the event to be removed
+        protect : set[int] | None
+            idx_ref values whose whole forward/backward pair must never be removed
         """
 
         idx_refs = set(idx_refs)  # make a set if there are doublons
@@ -636,6 +638,14 @@ class ReferenceEventTable:
         )  # find set idx backwards
 
         all_refs = idx_refs | backward_refs  # all ref to remove
+
+        if protect:
+            protect_backward = set(
+                self.table.loc[
+                    self.table["idx_ref"].isin(protect), "idx_backward"
+                ].astype(int)
+            )
+            all_refs -= set(protect) | protect_backward  # a pair is never split
 
         self.table = self.table[~self.table["idx_ref"].isin(all_refs)].reset_index(
             drop=True
@@ -694,7 +704,11 @@ class ActiveEventTable:
             self.table = pd.DataFrame(columns)
 
     def prune_for_recycling(
-        self, executed_idx: int, system: System, positions_pre: np.ndarray
+        self,
+        executed_idx: int,
+        system: System,
+        positions_pre: np.ndarray,
+        reference_table: ReferenceEventTable,
     ) -> None:
         """Replace `self.table` with the rows that survive the recycler's filter.
 
@@ -707,6 +721,14 @@ class ActiveEventTable:
             self.table = self.recycler.select_recyclable(
                 self, executed_idx, system, positions_pre
             )
+            # A recycled row's reference may have been purged from
+            # reference_table this step (a sibling instance failed
+            # reconstruction); drop it so it can't be selected later with a
+            # dead num_reference_event.
+            valid_refs = set(reference_table.table["idx_ref"])
+            self.table = self.table[
+                self.table["num_reference_event"].isin(valid_refs)
+            ].reset_index(drop=True)
 
     def existing_pairs(self) -> set[tuple[int, int]]:
         """Return `(atom_index, num_reference_event)` tuples already in the table."""
