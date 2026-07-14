@@ -239,22 +239,25 @@ def info_active_events(system_types, reference_table, active_table) -> EventsInf
     # Keep only one row per (central_atom, reference_event) pair for logging, dropping symmetry-equivalent copies
     keep = (~pd.DataFrame({"c": central_atom, "r": reference_events}).duplicated(keep="first")).to_numpy()
 
+    # Sort the kept rows by central atom
+    order = np.argsort(central_atom[keep], kind="stable")
+
     return EventsInfo(
-        types=types[keep],
-        central_atom=central_atom[keep],
-        initial_topologies=initial_topologies[keep],
-        reference_events=reference_events[keep],
-        dE_forward=dE_forward[keep],
-        dE_backward=dE_backward[keep],
-        dE_asym=dE_asym[keep],
-        k=k[keep],
-        dra_i=dra_i[keep],
-        dra_f=dra_f[keep],
-        refined=refined[keep],
-        event_id=event_ids[keep],
-        id_initial=initial_topologies[keep],
-        id_saddle=id_saddles[keep],
-        id_final=id_finals[keep],
+        types=types[keep][order],
+        central_atom=central_atom[keep][order],
+        initial_topologies=initial_topologies[keep][order],
+        reference_events=reference_events[keep][order],
+        dE_forward=dE_forward[keep][order],
+        dE_backward=dE_backward[keep][order],
+        dE_asym=dE_asym[keep][order],
+        k=k[keep][order],
+        dra_i=dra_i[keep][order],
+        dra_f=dra_f[keep][order],
+        refined=refined[keep][order],
+        event_id=event_ids[keep][order],
+        id_initial=initial_topologies[keep][order],
+        id_saddle=id_saddles[keep][order],
+        id_final=id_finals[keep][order],
     )
 
 
