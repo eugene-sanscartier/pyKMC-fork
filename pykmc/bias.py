@@ -544,7 +544,7 @@ class PointBias(Bias):
             if self._atom_set is not None and atom_idx not in self._atom_set:
                 return self.pass_unlisted
             current_pos = system.positions[atom_idx]
-            to_target = self._target - current_pos
+            to_target = minimum_image_vector(current_pos, self._target, system.cell)
             dist = np.linalg.norm(to_target)
             if dist < 1e-10:
                 return True
@@ -562,7 +562,7 @@ class PointBias(Bias):
             event, system, neighbors_list
         ):
             current_pos = system.positions[atom_idx]
-            to_target = self._target - current_pos
+            to_target = minimum_image_vector(current_pos, self._target, system.cell)
             dist = np.linalg.norm(to_target)
             if dist < 1e-10:
                 return True
@@ -700,11 +700,13 @@ class TopoBias(Bias):
             return True
         current_pos = system.positions[atom_idx]
         final_pos = current_pos + displacement
-        current_min_dist = float(
-            np.min(np.linalg.norm(self._target_positions - current_pos, axis=1))
+        current_min_dist = min(
+            np.linalg.norm(minimum_image_vector(current_pos, target, system.cell))
+            for target in self._target_positions
         )
-        final_min_dist = float(
-            np.min(np.linalg.norm(self._target_positions - final_pos, axis=1))
+        final_min_dist = min(
+            np.linalg.norm(minimum_image_vector(final_pos, target, system.cell))
+            for target in self._target_positions
         )
         accepted = final_min_dist < current_min_dist
         _LOGGER.debug(
