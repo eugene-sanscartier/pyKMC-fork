@@ -29,6 +29,10 @@ utils/analyse/*.xyz
 
 # LAMMPS / simulation outputs
 *core
+!**/_core/
+!**/_core/**
+**/_core/__pycache__/
+**/_core/**/*.py[cod]
 log.lammps
 pykmc.*
 
