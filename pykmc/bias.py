@@ -31,8 +31,11 @@ class Bias(ABC):
     - ``"boost"``: rate-boost mode.  Events that pass :meth:`accept` have their
       rates multiplied by a dynamic factor α so they fire with probability
       *bias_weight* at each step, while all other events remain in the pool and
-      compete at their natural rates.  ``delta_t`` is corrected to the true
-      total rate.
+      compete at their natural rates.  α is floored at 1: if the desired events
+      already fire with probability ≥ *bias_weight* under their true rates, no
+      boosting is applied and the true rates are used unmodified (the bias
+      never suppresses an already-favoured event below its natural rate).
+      ``delta_t`` is corrected to the true total rate.
 
     Subclasses must implement :meth:`accept`.  Subclasses that need to cache
     per-step context (e.g. topology lookups) should override :meth:`_prepare`.
@@ -43,7 +46,9 @@ class Bias(ABC):
         Selection mode.  Default is ``"filter"``.
     bias_weight : float
         Target probability ∈ (0, 1) that a desired event is selected at each
-        step.  Only used in ``"boost"`` mode.  Default is 0.5.
+        step.  Only used in ``"boost"`` mode, and only enforced as a floor:
+        if desired events already fire with probability ≥ *bias_weight*
+        under their true rates, they are left unboosted.  Default is 0.5.
     pass_unlisted : bool
         Return value of :meth:`accept` for atoms that are **not** in the
         ``atom_indices`` whitelist.  ``False`` (default) treats non-listed
@@ -278,13 +283,31 @@ class Bias(ABC):
                 f" using unbiased selection"
             )
             return selection_algorithm(l_k)
-        alpha = self.bias_weight * k_free / ((1 - self.bias_weight) * k_boost)
+        alpha = max(
+            1.0, self.bias_weight * k_free / ((1 - self.bias_weight) * k_boost)
+        )
         _LOGGER.debug(
             f"\t :=> Boost: desired={int(np.count_nonzero(desired_mask))},"
             f" undesired={int(np.count_nonzero(~desired_mask))},"
             f" k_boost={float(k_boost):.6e}, k_free={float(k_free):.6e},"
             f" bias_weight={float(self.bias_weight):.3f}, alpha={float(alpha):.6e}"
+            + (" (floored, desired already dominant)" if alpha == 1.0 else "")
         )
+        for i in np.nonzero(desired_mask)[0]:
+            row = active_table.table.loc[i]
+            num_ref = row.get("num_reference_event", None)
+            event_id = fmt_hash(
+                reference_table.table[reference_table.table["idx_ref"] == num_ref][
+                    "event_id"
+                ].values[0]
+            )
+            _LOGGER.debug(
+                f"\t\t :=> Desired event: idx={int(i)},"
+                f" atom_index={row.get('atom_index', '?')},"
+                f" reference_event={num_ref},"
+                f" Ea={row.get('dE_forward', float('nan')):.6f} eV,"
+                f" event_id={event_id}"
+            )
         l_k_boosted = l_k.copy()
         l_k_boosted[desired_mask] *= alpha
         idx, delta_t_boosted, ktot_boosted = selection_algorithm(l_k_boosted)

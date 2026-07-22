@@ -623,6 +623,30 @@ class TestBoostMode:
         ]
         assert 1 in selections
 
+    def test_desired_already_dominant_not_suppressed(self):
+        """If the desired event's true rate already exceeds bias_weight's
+        implied share, alpha floors at 1 and true rates are used unmodified
+        (no suppression of an already-favoured event)."""
+        system = make_system([[0.0, 0.0, 0.0]])
+        ref = MagicMock()
+        ref.table = pd.DataFrame(
+            {"idx_ref": [0, 0], "move_atom_idx": [0, 0], "event_id": ["ev0", "ev0"]}
+        )
+        events = [
+            make_event(atom_index=0, final_positions=[[1.0, 0.0, 0.0]], k=9.0),
+            make_event(atom_index=0, final_positions=[[-1.0, 0.0, 0.0]], k=1.0),
+        ]
+        active = make_active_table(events)
+        l_k = np.array([e["k"] for e in events])
+        bias = DirectionBias(direction=[1, 0, 0], mode="boost", bias_weight=0.5)
+        n_desired = sum(
+            bias.select(rejection_free, l_k, active, system, ref)[0] == 0
+            for _ in range(2000)
+        )
+        # True rate already gives P(desired) = 9/10 = 0.9, well above
+        # bias_weight=0.5; the floor must preserve that, not push it down to 0.5.
+        assert abs(n_desired / 2000 - 0.9) < 0.05
+
     def test_pass_unlisted_true_with_atom_indices_raises_direction(self):
         """DirectionBias: boost + pass_unlisted=True + atom_indices → ValueError."""
         with pytest.raises(ValueError, match="pass_unlisted=True"):
