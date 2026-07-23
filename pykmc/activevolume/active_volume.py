@@ -8,6 +8,7 @@ import ctypes
 from ase.geometry import find_mic
 from ..system import System
 from ..config import Config
+from ..utils.geometry import compute_distances
 
 
 def define_AV(config, central_atom_idx: int, positions, cell):
@@ -205,21 +206,16 @@ def partn_refine_AV(
 
 
 def position_results_AV(
-    config, artn, atom_map, positions
+    config, artn, atom_map, positions, cell
 ) -> [np.array, np.array, np.array, int]:
 
     min1positions = artn.extract("tau_min1")
     min2positions = artn.extract("tau_min2")
     saddlepositions = artn.extract("tau_sad")
 
-    # find atom that moves the most
-    dist = (min1positions - saddlepositions) ** 2
-    dist = dist.sum(axis=-1)
-    dist = np.sqrt(dist)
-    dist[dist > config.atomicenvironment.rcut] = (
-        0
-        # if atom moves more that rcutevent, consider that it crosses the cell (happens with lammps), so distance = 0 to not consider it as the one that moves the most
-    )
+    # find atom that moves the most (PBC-aware, so an atom crossing the
+    # periodic boundary between min1 and saddle isn't mistaken for a small mover)
+    dist = compute_distances(min1positions, saddlepositions, cell=cell)
     index_move = np.argmax(dist)
 
     index_move_mapped = atom_map[index_move]

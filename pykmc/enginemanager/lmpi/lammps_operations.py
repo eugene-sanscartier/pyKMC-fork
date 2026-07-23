@@ -5,7 +5,7 @@ import ctypes
 import pypARTn
 from types import SimpleNamespace
 from ...utils.io_utils import capture_output
-from ...utils.geometry import compute_delr_max
+from ...utils.geometry import compute_delr_max, compute_distances
 from ...activevolume.active_volume import (
     reset,
     redefine_atoms,
@@ -506,20 +506,17 @@ def partn_search(
 
             if config.control.active_volume == True:
                 min1positions, min2positions, saddlepositions, index_move = (
-                    position_results_AV(config, artn, atom_map, positions)
+                    position_results_AV(config, artn, atom_map, positions, cell)
                 )
             else:
                 min1positions = artn.extract("tau_min1")
                 min2positions = artn.extract("tau_min2")
                 saddlepositions = artn.extract("tau_sad")
 
-                # find atom that moves the most
-                dist = (min1positions - saddlepositions) ** 2
-                dist = dist.sum(axis=-1)
-                dist = np.sqrt(dist)
-                dist[dist > config.atomicenvironment.rcut] = (
-                    0  # if atom moves more that rcutevent, consider that it crosses the cell (happens with lammps), so distance = 0 to not consider it as the one that moves the most
-                )
+                # find atom that moves the most (PBC-aware, so an atom crossing
+                # the periodic boundary between min1 and saddle isn't mistaken
+                # for a small mover)
+                dist = compute_distances(min1positions, saddlepositions, cell=cell)
                 index_move = np.argmax(dist)
 
             delr_threshold = config.eventsearch.delr_thr
@@ -679,6 +676,7 @@ def partn_refine(
 
         max_attempts = config.partn.r_max_attempts
         inner_attempt = 0
+        attempts_detail = []
         atoms_frozen = _make_frozen_group(engine, config, positions, types)
         _apply_frozen_fix(engine, "f_frozen_pre", atoms_frozen)
 
@@ -744,6 +742,24 @@ def partn_refine(
                                     refined="T",
                                 )
                             )
+                        else:
+                            attempts_detail.append(
+                                {
+                                    "attempt": inner_attempt,
+                                    "err": err,
+                                    "has_sad": True,
+                                    "delr_sad": delr_sad,
+                                }
+                            )
+                    else:
+                        attempts_detail.append(
+                            {
+                                "attempt": inner_attempt,
+                                "err": err,
+                                "has_sad": bool(has_extract),
+                                "delr_sad": None,
+                            }
+                        )
             exit_flag = engine.local_engine_comm.bcast(exit_flag, root=0)
             if exit_flag:
                 _remove_frozen_fix(engine, "f_frozen_pre", atoms_frozen)
@@ -763,6 +779,7 @@ def partn_refine(
                         type=ErrorType.EVENT_NOT_FOUND,
                         message="no event found",
                         details=err,
+                        variables={"attempts_detail": attempts_detail},
                     )
                 )
             return None

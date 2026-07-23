@@ -328,6 +328,7 @@ class Refinement:
                 res,
                 abs(res.ok_value().dE_forward - prepared.reference_energy_barrier),
                 self.config.eventsearch.refined_energy_thr,
+                task.num_reference_event,
             )
 
         err = res.err_value()
@@ -343,6 +344,7 @@ class Refinement:
         result_refine: Result[EventRefinementOutput, ErrorInfo],
         energy_mismatch: float,
         refined_energy_thr: float,
+        num_reference_event: int,
     ) -> Result[EventRefinementOutput, ErrorInfo]:
         """Check if the energy barrier of the refinement correspond the one of the reference event.
 
@@ -354,6 +356,8 @@ class Refinement:
             Difference between the reference event energy barrier and the refine one.
         refined_energy_thr : float
             maximum allowed difference (in eV) between a reference event's initial barrier energy and its refined barrier energy
+        num_reference_event : int
+            Reference event this refinement task was attempting, recorded on failure for diagnostics.
 
         Returns
         -------
@@ -366,6 +370,10 @@ class Refinement:
                 ErrorInfo(
                     type=ErrorType.REFINEMENT_INVALID_ENERGY_BARRIER,
                     message="refinement energy barrier does not match reference one",
+                    variables={
+                        "n_ref_event": num_reference_event,
+                        "num_reference_event": num_reference_event,
+                    },
                 )
             )
         else:

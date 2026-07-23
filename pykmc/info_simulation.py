@@ -167,7 +167,12 @@ def info_refinements(
         },
         "invalid_dE": {"n": 0, "ref_event": []},
         "invalid_minima": {"n": 0, "ref_event": []},
-        "event_not_found": {"n": 0, "ref_event": []},
+        "event_not_found": {
+            "n": 0,
+            "ref_event": [],
+            "no_saddle_found": 0,
+            "delr_sad_too_large": 0,
+        },
         "runtime_error": {"n": 0, "ref_event": []},
     }
     for res in results_refinements:
@@ -190,10 +195,21 @@ def info_refinements(
                     ].append(res.err_value().variables["matching_score"])
                 case ErrorType.REFINEMENT_INVALID_ENERGY_BARRIER:
                     n_fails["invalid_dE"]["n"] += 1
+                    n_fails["invalid_dE"]["ref_event"].append(
+                        res.err_value().variables["n_ref_event"]
+                    )
                 case ErrorType.REFINEMENT_INVALID_MINIMA:
                     n_fails["invalid_minima"]["n"] += 1
                 case ErrorType.EVENT_NOT_FOUND:
                     n_fails["event_not_found"]["n"] += 1
+                    n_fails["event_not_found"]["ref_event"].append(
+                        res.err_value().variables["n_ref_event"]
+                    )
+                    for attempt in res.err_value().variables["attempts_detail"]:
+                        if attempt["has_sad"]:
+                            n_fails["event_not_found"]["delr_sad_too_large"] += 1
+                        else:
+                            n_fails["event_not_found"]["no_saddle_found"] += 1
                 case ErrorType.EVENT_REFINEMENT_RUNTIME_ERROR:
                     n_fails["runtime_error"]["n"] += 1
                     n_fails["runtime_error"]["ref_event"].append(
