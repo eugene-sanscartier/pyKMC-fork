@@ -277,6 +277,8 @@ class KMC:
                 delta_t,
                 ktot,
                 idx_selected_event,
+                err_reference,
+                err_ae,
             ) = self.reconstruction(active_table)
             num_ref_selected = active_table.table.loc[idx_selected_event].at[
                 "num_reference_event"
@@ -284,6 +286,24 @@ class KMC:
             events_info = info_active_events(
                 self.system.types, self.reference_table, active_table
             )
+            if len(err_reference) != 0:
+                selected_topo = self.reference_table.table[
+                    self.reference_table.table["idx_ref"] == num_ref_selected
+                ]["id_initial"].values[0]
+                self.loggers.info(
+                    "log",
+                    "\t :=> Removing reference event from which reconstruction failed.",
+                )
+                self.reference_table.remove(
+                    list(set(err_reference)), protect={num_ref_selected}
+                )
+                self.loggers.info(
+                    "log",
+                    "\t :=> Removing topology from known environments from which reconstruction failed.",
+                )
+                self.visited_environments = self.visited_environments.difference(
+                    set(err_ae) - {selected_topo}
+                )
             # INFO :
             self.loggers.events_file_step_first_line("events", step)
             self.loggers.events_applicable_info_line("events", idx_selected_event)
@@ -737,6 +757,8 @@ class KMC:
     def reconstruction(self, active_table):
         # TODO make a Result
 
+        err_reference = []
+        err_ae = []
         while len(active_table.table) > 0:
             ##=>Select event
             idx_selected_event, delta_t, ktot = self._select_event(active_table)
@@ -782,35 +804,14 @@ class KMC:
                         f"[type={err_type}] : {err.message}"
                     ),
                 )
-                atom_index = int(selected_event.at["atom_index"])
                 ae_topo = self.reference_table.table[
                     self.reference_table.table["idx_ref"] == num_ref_event
                 ]["id_initial"].values[0]
+                err_reference += [num_ref_event]
+                err_ae += [ae_topo]
 
                 self.loggers.info("log", "\t :=> Removing active event.")
                 active_table.remove(idx_selected_event)
-
-                self.loggers.info(
-                    "log", "\t :=> Searching for a replacement event for this atom."
-                )
-                event_search = self.execute_event_searches([atom_index])
-                search_results = event_search.get_successes_results()
-                if self.inactive_ae is not None:
-                    inactive_set = set(self.inactive_ae.get_atoms_with_id("in"))
-                    search_results = [
-                        r for r in search_results if r.move_atom_index not in inactive_set
-                    ]
-                self.add_reference_events(search_results)
-
-                subset_reference_event_table = self.reference_table.has_id_subset_table(
-                    [ae_topo]
-                )
-                refinement = self.execute_refinements(
-                    subset_reference_event_table,
-                    existing_pairs=active_table.existing_pairs()
-                    | {(atom_index, int(num_ref_event))},
-                )
-                self.add_active_events(refinement.get_successes_results())
         else:
             self.loggers.error("log", "All event reconstuctions failed.")
             self._close()
@@ -820,6 +821,8 @@ class KMC:
             delta_t,
             ktot,
             idx_selected_event,
+            err_reference,
+            err_ae,
         )
 
     def _reconstruction_active_event(
