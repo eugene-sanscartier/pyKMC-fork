@@ -289,8 +289,9 @@ class ReferenceEventTable:
             if the event is in the table.
 
         """
-        # Only select rows with same event_id as dfenvent :
-        subset = self.table[self.table["event_id"] == dfevent["event_id"]]
+        # Only select rows with same id_initial as dfevent (coarse topology
+        # pre-filter; the PSR/IRA check below decides true duplication):
+        subset = self.table[self.table["id_initial"] == dfevent["id_initial"]]
         if len(subset) == 0:
             return True
 
