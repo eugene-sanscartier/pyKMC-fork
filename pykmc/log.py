@@ -334,7 +334,7 @@ class LogKMC(LogManager):
 
     OUTPUT_TABLE_COLUMNS: ClassVar[tuple[tuple[int, str, str], ...]] = (
         (10, "n", "Step"),
-        (14, ".6e", "E(eV)"),
+        (18, ".4f", "E(eV)"),
         (14, ".6f", "Ea(eV)"),
         (14, ".6e", "dT(s)"),
         (14, ".6e", "k_evt(ps-1)"),

@@ -100,7 +100,7 @@ class EventSearch:
             except Exception as exc:
                 self.loggers.error(
                     "log",
-                    f"\n\t task {task.task_id:5d} | atom {task.central_atom_index:6d} | {'RAISE':<5} type={type(exc).__name__}",
+                    f"\t task {task.task_id:5d} | atom {task.central_atom_index:6d} | {'RAISE':<5} type={type(exc).__name__}",
                 )
                 raise
             run_results[task.task_id] = result
@@ -115,7 +115,7 @@ class EventSearch:
         if not self.loggers.is_enabled_for("log", logging.DEBUG):
             return
 
-        prefix = f"\n\t task {task.task_id:5d} | atom {task.central_atom_index:6d}"
+        prefix = f"\t task {task.task_id:5d} | atom {task.central_atom_index:6d}"
         if result.is_ok():
             output = result.ok_value()
             self.loggers.debug(
