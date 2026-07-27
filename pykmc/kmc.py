@@ -44,7 +44,7 @@ from .info_simulation import (
 )
 from .eventsearch import EventSearch
 from .refinement import Refinement
-from .log import Colors
+from .log import Colors, fmt_hash
 import time
 from .utils import push_towards, compute_delr
 import copy
@@ -744,21 +744,46 @@ class KMC:
         while len(active_table.table) > 0:
             ##=>Select event
             idx_selected_event, delta_t, ktot = self._select_event(active_table)
+            selected_event = active_table.table.loc[idx_selected_event]
+            self.loggers.info(
+                "log",
+                (
+                    "\n\t :=> Selected event context: "
+                    f"idx={idx_selected_event}, "
+                    f"atom_index={selected_event.at['atom_index']}, "
+                    f"reference_event={selected_event.at['num_reference_event']}, "
+                    f"k={selected_event.at['k']:.6e}, "
+                    f"Ea={selected_event.at['energy_barrier']:.6f} eV"
+                ),
+            )
             ##=>Reconstruct event
             self.loggers.info("log", "\t :=> Event Reconstruction")
             result_reconstruction = self._reconstruction_active_event(
                 idx_selected_event, active_table
             )
             if result_reconstruction.is_ok():
+                num_ref_event = active_table.table.loc[idx_selected_event].at[
+                    "num_reference_event"
+                ]
+                event_id = self.reference_table.table[
+                    self.reference_table.table["idx_ref"] == num_ref_event
+                ]["event_id"].values[0]
+                self.loggers.info(
+                    "log",
+                    f"\t :=> Reconstruction succeeded (reference event {num_ref_event}, event_id={fmt_hash(event_id)}, Ea={selected_event.at['energy_barrier']:.6f} eV).",
+                )
                 break
             else:
                 num_ref_event = active_table.table.loc[idx_selected_event].at[
                     "num_reference_event"
                 ]
+                err = result_reconstruction.err_value()
+                err_type = getattr(err, "type", "UNKNOWN")
                 self.loggers.info(
                     "log",
-                    "\t :=> Reconstruction fails (reference event {}) :  {}".format(
-                        num_ref_event, result_reconstruction.err_value().message
+                    (
+                        f"\t :=> Reconstruction fails (reference event {num_ref_event}) "
+                        f"[type={err_type}] : {err.message}"
                     ),
                 )
                 ae_topo = self.reference_table.table[

@@ -470,6 +470,7 @@ def partn_refine(
 
     max_attempts = config.partn.r_max_attempts
     attempt = 0
+    attempts_detail = []
     atoms_frozen = _make_frozen_group(engine, config, positions, types)
     _apply_frozen_fix(engine, "f_frozen_pre", atoms_frozen)
 
@@ -515,6 +516,24 @@ def partn_refine(
                             refined="T",
                         )
                     )
+                else:
+                    attempts_detail.append(
+                        {
+                            "attempt": attempt,
+                            "err": err,
+                            "has_sad": True,
+                            "delr_sad": delr_sad,
+                        }
+                    )
+            else:
+                attempts_detail.append(
+                    {
+                        "attempt": attempt,
+                        "err": err,
+                        "has_sad": False,
+                        "delr_sad": None,
+                    }
+                )
         # Synchronize all ranks
         exit_flag = engine.local_engine_comm.bcast(exit_flag, root=0)
         if exit_flag:
@@ -535,6 +554,7 @@ def partn_refine(
                     type=ErrorType.EVENT_NOT_FOUND,
                     message="no event found",
                     details=err,
+                    variables={"attempts_detail": attempts_detail},
                 )
             )
         return None

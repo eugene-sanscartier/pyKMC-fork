@@ -12,6 +12,15 @@ from enum import Enum
 import re
 from .config import Config
 
+DISPLAYED_HASH_LENGTH = 8
+
+
+def fmt_hash(value: str | None, length: int = DISPLAYED_HASH_LENGTH) -> str:
+    """Return the human-readable hash prefix used in log output."""
+    if value is None:
+        return "?"
+    return value[:]
+
 
 class LogManager:
     """Manage the configuration and usage of multiple standard Python loggers.
