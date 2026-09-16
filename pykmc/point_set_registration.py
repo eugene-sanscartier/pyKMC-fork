@@ -1,5 +1,6 @@
 """Manages Point Set Registration (shape matching) methods."""
 
+from .utils.io_utils import capture_output
 import ira_mod
 from .result import Result, ErrorInfo, PSROutput, Ok, Err, ErrorType
 from .parameters import Parameters
@@ -136,6 +137,14 @@ def check_match(
             return result_match  # Ok(PSROutput)
 
 
+_ira = None
+def _get_ira() -> "ira_mod.IRA":
+    """One shared `ira_mod.IRA()` instance, reused across every `simple_ira` call."""
+    global _ira
+    if _ira is None: _ira = ira_mod.IRA()
+    return _ira
+
+@capture_output()
 def simple_ira(
     configuration_1: Configuration,
     configuration_2: Configuration,
@@ -154,8 +163,7 @@ def simple_ira(
     typ1 = list(configuration_1.types) if full else nat1 * ["X"]
     typ2 = list(configuration_2.types) if full else nat2 * ["X"]
     candidate_kwargs = {"candidate1": candidate1, "candidate2": candidate2} if candidate1 is not None else {}
-    # Run ira to find transformation matrices
-    ira = ira_mod.IRA()
+    ira = _get_ira()
     try:
         rmat, tr, perm, dh = ira.match(
             nat1, typ1, configuration_1.positions, nat2, typ2, configuration_2.positions, kmax_factor, **candidate_kwargs

@@ -1,6 +1,11 @@
+from __future__ import annotations
 from abc import ABC, abstractmethod
 import pandas as pd
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+from ..result import ShapeID
+
+if TYPE_CHECKING:
+    from ..event_table import ReferenceEventTable
 
 
 class Detector(ABC):
@@ -16,7 +21,7 @@ class DetectorThreshold(Detector):
     def detect(
         self,
         pds_selected_active_event: pd.Series,
-        df_reference_table: pd.DataFrame,
+        reference_table: ReferenceEventTable,
         energy_threshold: float,
         is_refined: Optional[bool] = False,
     ):
@@ -30,8 +35,10 @@ class DetectorThreshold(Detector):
         ----------
         pds_selected_active_event : pd.Series
             A pandas Series of the selected active event.
-        df_reference_table : pd.DataFrame
-            A pandas DataFrame with all generic events.
+        reference_table : ReferenceEventTable
+            The table of all generic events, taken whole rather than as its
+            bare DataFrame so the backward event's shape can be selected with
+            the table's own `rows_with_shape`.
         energy_threshold : float
             Energy threshold to considere the system in a basin.
         is_refined : Optional[bool]
@@ -40,6 +47,7 @@ class DetectorThreshold(Detector):
             or is already a reference-table row itself.
         """
 
+        df_reference_table = reference_table.table
         dE_forward = pds_selected_active_event["dE_forward"]
 
         if dE_forward >= energy_threshold:
@@ -87,11 +95,13 @@ class DetectorThreshold(Detector):
 
             # Every catalogued pathway sharing the backward row's own decorated
             # shape is a candidate reverse reaction, not just this one row --
-            # take the lowest barrier among them, exactly as before.
-            df_backward_events = df_reference_table[
-                (df_reference_table["id_initial"] == backward_row["id_initial"])
-                & (df_reference_table["sid_initial"] == backward_row["sid_initial"])
-            ]
+            # take the lowest barrier among them.
+            df_backward_events = reference_table.rows_with_shape(
+                df_reference_table,
+                "id_initial",
+                "sid_initial",
+                ShapeID(backward_row["id_initial"], int(backward_row["sid_initial"])),
+            )
 
             # Check if at least one backward event has a low energy barrier
             dE_backward = df_backward_events["dE_forward"].min()

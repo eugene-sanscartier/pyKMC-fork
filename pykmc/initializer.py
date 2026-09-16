@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .kmc import KMC
 from .log import LogKMC, LOGGING_CONFIG
+from . import log
 from .system import System
 from .neighbors_list import NeighborsList
 from .atomic_environment import AtomicEnvironment
@@ -41,12 +42,12 @@ class Initializer:
         self.initialize_bias()
 
         self.kmc.loggers.new_line("log")
-        self.kmc.loggers.info("log", "===========================")
-        self.kmc.loggers.info("log", "= Starting KMC simulation =")
-        self.kmc.loggers.info("log", "===========================")
+        log.info("===========================")
+        log.info("= Starting KMC simulation =")
+        log.info("===========================")
 
         if self.kmc.params.control.restart_file is not None:
-            self.kmc.loggers.info("log", ":=> Restarting")
+            log.info("Restarting")
 
     def initialize_loggers(self) -> None:
         """Initialize the loggers and create their files."""
@@ -62,19 +63,14 @@ class Initializer:
 
     def initialize_system(self) -> None:
         """Read and initialize the system from the intial configuration file."""
-        self.kmc.loggers.info(
-            "log",
-            ":=> Reading initial configuration file : {}".format(
-                self.kmc.params.control.initial_config
-            ),
-        )
+        log.info(f"Reading initial configuration file : {self.kmc.params.control.initial_config}")
         self.kmc.system = System.create_from_file(
             self.kmc.params.control.initial_config
         )
 
     def initialize_neighbors_list(self) -> None:
         """Construct a new Neighbors List."""
-        self.kmc.loggers.info("log", ":=> Constructing Neighbors Lists")
+        log.info("Constructing Neighbors Lists")
         self.kmc.neighbors_list = NeighborsList(
             self.kmc.system,
             self.kmc.params.atomicenvironment.rnei,
@@ -84,7 +80,7 @@ class Initializer:
 
     def initialize_atomic_environments(self) -> None:
         """Construct a new Atomic Environment."""
-        self.kmc.loggers.info("log", ":=> Computing Atomic Environments")
+        log.info("Computing Atomic Environments")
         self.kmc.atomic_environment = AtomicEnvironment(
             self.kmc.params.atomicenvironment.style,
             self.kmc.neighbors_list.neighbors_list["rnei"],
@@ -98,14 +94,9 @@ class Initializer:
     def initialize_reference_table(self) -> None:
         """Initialize the Reference Event Table."""
         if self.kmc.params.control.reference_table is not None:
-            self.kmc.loggers.info(
-                "log",
-                ":=> Reading Reference table file {}".format(
-                    self.kmc.params.control.reference_table
-                ),
-            )
+            log.info(f"Reading Reference table file {self.kmc.params.control.reference_table}")
         else:
-            self.kmc.loggers.info("log", ":=> Generate a empty reference table")
+            log.info("Generate a empty reference table")
         self.kmc.reference_table = ReferenceEventTable(self.kmc.params)
 
     def initialize_bias(self) -> None:
@@ -154,12 +145,7 @@ class Initializer:
     def _initialize_visited_environments(self) -> None:
         """Initialize visited environment from file if specified, else initialize as {'crystal'}."""
         if self.kmc.params.control.visited_environments is not None:
-            self.kmc.loggers.info(
-                "log",
-                ":=> Initiating visited environment from file {}".format(
-                    self.kmc.params.control.visited_environments
-                ),
-            )
+            log.info(f"Initiating visited environment from file {self.kmc.params.control.visited_environments}")
             try:
                 with open(self.kmc.params.control.visited_environments, "rb") as file:
                     loaded_set_environments = pickle.load(file)
@@ -172,7 +158,4 @@ class Initializer:
             self.kmc.params.control.visited_environments
             and not self.kmc.params.control.reference_table
         ):
-            self.kmc.loggers.warning(
-                "log",
-                "Visited environments are read from file while no reference table was provided",
-            )
+            log.warning("Visited environments are read from file while no reference table was provided")

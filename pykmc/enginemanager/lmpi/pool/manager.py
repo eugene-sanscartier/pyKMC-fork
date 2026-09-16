@@ -187,7 +187,20 @@ class Manager:
         future = self.submit_job("minimize", {"params": params})
         return future
 
-    def minimize_with_results(self, params, configuration):
+    def minimize_with_results(self, params, configuration) -> Future:
+        """One minimization: spread over the session pool in local mode, on the global session in global mode.
+
+        Dispatching several of these before reading any result is what makes
+        independent minimizations run concurrently; in global mode there is a
+        single engine, so they run one after the other as they are submitted.
+        """
+        if self.using_global:
+            future = Future()
+            future.set_result(
+                self.global_session.minimize_with_results(params, configuration)
+            )
+            return future
+
         future = self.submit_job(
             "minimize_with_results",
             {"params": params, "configuration": configuration},

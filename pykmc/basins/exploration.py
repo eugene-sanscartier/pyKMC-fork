@@ -4,7 +4,6 @@ from pykmc import Parameters, ReferenceEventTable
 from typing import TYPE_CHECKING
 from .connectivity import StatesConnectivity, BasinStatesConnectivity
 from .detection import DetectorThreshold
-from ..result import ShapeID
 import pandas as pd
 
 if TYPE_CHECKING:
@@ -60,7 +59,6 @@ class BasinGenericEventExplorer(Explorer):
     def explore(
         self,
         state: "StateData",
-        atom_shapes: dict[int, ShapeID],
         state_index: int = 0,
         start_index: int = 1,
     ) -> None:
@@ -76,13 +74,12 @@ class BasinGenericEventExplorer(Explorer):
         Parameters
         ----------
         state : StateData
-            Current atomic configuration to explore.
-        atom_shapes : dict[int, ShapeID]
-            Every non-crystal atom's already-resolved `ShapeID` in `state`,
-            from `BasinsGenericEvents.is_states_has_unknown_environments()`
-            (classify-only -- exploration never mints a new persistent shape
-            from a hypothetical state) -- passed straight through to
-            `live_events()` so it can look shapes up instead of reclassifying.
+            Current atomic configuration to explore. Its `atom_shapes` --
+            every non-crystal atom's `ShapeID`, resolved once by
+            `BasinsGenericEvents.unknown_environment()`
+            (classify-only: exploration never mints a new persistent shape
+            from a hypothetical state) -- goes straight to `live_events()`,
+            which looks shapes up instead of reclassifying.
         state_index : int, optional
             Index of the current state in the global basin state list.
             By default 0 (first state).
@@ -100,12 +97,12 @@ class BasinGenericEventExplorer(Explorer):
         # is computed once per event, cached across every atom sharing it.
         count = 0
         row_info_cache: dict[int, tuple] = {}
-        for at, df_event in self.reference_table.live_events(atom_shapes):
+        for at, df_event in self.reference_table.live_events(state.atom_shapes):
             ref_event = int(df_event.at["idx_ref"])
             if ref_event not in row_info_cache:
                 is_transient = self.detector.detect(
                     df_event,
-                    self.reference_table.table,
+                    self.reference_table,
                     self.params.basin.energy_thr,
                 )
                 backward_idx = df_event.at["idx_backward"]

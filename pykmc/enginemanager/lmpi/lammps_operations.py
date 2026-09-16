@@ -37,6 +37,25 @@ from ...result import (
     EventRefinementOutput,
 )
 
+# ARTn's errno is a coarse category (several unrelated messages share the same
+# one), so the message itself -- not the errno -- is what tells one failure
+# apart from another. Keyed by a recognizable prefix rather than the whole
+# string, since ARTn appends free-form advice after it (e.g. "EIGENVALUE
+# LOST, try to increase nnewchance or nsmooth").
+_ARTN_SHORT_MESSAGES = {
+    "EIGENVALUE LOST": "EIGENVALUE_LOST",
+    "ENERGY EXCEEDS THE LIMIT": "ENERGY_EXCEEDS_THE_LIMIT",
+    "NUMBER OF STEPS EXCEEDS THE LIMIT": "NUMBER_OF_STEPS_EXCEEDS_THE_LIMIT",
+}
+
+
+def _artn_error_details(errno: int, message: str) -> str:
+    """Render an ARTn (errno, message) pair, tagging a recognized message with its short label."""
+    for prefix, label in _ARTN_SHORT_MESSAGES.items():
+        if message.startswith(prefix):
+            return f"errno={errno}: [{label}]"
+    return f"errno={errno}: {message}"
+
 
 def initialize_system(engine, configuration: Configuration, params=None):
 
@@ -333,7 +352,7 @@ def partn_search(engine, params, central_atom_idx: int, configuration: Configura
         engine.command("min_style fire")
 
         artn.reset_input()
-        artn.set("filout", "artn.out." + str(engine.engine_id))
+        artn.set("filout", "artn_search.out." + str(engine.engine_id))
         artn.set("engine_units", "lammps/metal")
         artn.set("verbose", params.partn.verbosity)
         artn.set("struc_format_out", "none")
@@ -486,8 +505,8 @@ def partn_search(engine, params, central_atom_idx: int, configuration: Configura
             return Err(
                 ErrorInfo(
                     type=ErrorType.EVENT_NOT_FOUND,
-                    message="No event found",
-                    details=err,
+                    message="",
+                    details=_artn_error_details(*err),
                 )
             )
 
@@ -539,7 +558,7 @@ def partn_refine(
         artn = pypARTn.artn(engine="lammps")
         engine.command(f"plugin load {artn.lib._name}")
         artn.reset_input()
-        artn.set("filout", "artn.out." + str(engine.engine_id))
+        artn.set("filout", "artn_refine.out." + str(engine.engine_id))
         artn.set("engine_units", "lammps/metal")
         artn.set("verbose", params.partn.verbosity)
         artn.set("struc_format_out", "none")
@@ -684,8 +703,8 @@ def partn_refine(
                 return Err(
                     ErrorInfo(
                         type=ErrorType.EVENT_NOT_FOUND,
-                        message="no event found",
-                        details=err,
+                        message="",
+                        details=_artn_error_details(*err),
                         variables={"attempts_detail": attempts_detail},
                     )
                 )

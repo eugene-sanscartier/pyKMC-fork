@@ -1,11 +1,8 @@
 """Determine cristalline environments."""
 
 
-def cna_signature(neighbors_list: list[list[int]]) -> list[str]:
-    """Classify atomic environments by neighbor count.
-
-    Determine if each atom's environment is 'crystal' (12, 8, or 6 neighbors)
-    or 'noncrystal'.
+def cna_signature(neighbors_list: list[list[int]]) -> list[dict]:
+    """Each atom's `(n_common, n_bonds) -> count` common-neighbor signature.
 
     Parameters
     ----------
@@ -14,35 +11,33 @@ def cna_signature(neighbors_list: list[list[int]]) -> list[str]:
 
     Returns
     -------
-    list[str]
-        'crystal' or 'noncrystal' classification for each atom.
+    list[dict]
+        One signature counter per atom.
 
     """
+
+    # Every intersection below is taken over these, so each atom's set is
+    # built once here rather than once per pair (and once per triple) that
+    # mentions it -- the difference between 4k and ~240k set constructions
+    # for a 4k-atom system.
+    neighbor_sets = [set(neighbors) for neighbors in neighbors_list]
 
     all_signatures = []
     # Compute signature
     for i, neighbors_i in enumerate(neighbors_list):
+        set_i = neighbor_sets[i]
         signatures = {}  # signature for all i,j pairs
         for j in neighbors_i:
-            neighbors_j = neighbors_list[j]
-
             # common neighbors between i and j : first signature value
-            common_neighbors = list(set(neighbors_i) & set(neighbors_j))  # intersection
-            n_common = len(common_neighbors)
-            if n_common == 0:
+            common_neighbors = set_i & neighbor_sets[j]  # intersection
+            if not common_neighbors:
                 continue
 
             # How many common_neighbors are first neighbors/connected
-            n_bonds = 0
-            for k in common_neighbors:
-                neighbors_k = neighbors_list[k]
-                n_bonds += len(
-                    set(neighbors_k) & set(common_neighbors)
-                )  # Check neighbors of k in common neighbors of i and j
-            n_bonds //= 2
+            n_bonds = sum(len(neighbor_sets[k] & common_neighbors) for k in common_neighbors) // 2
 
             # Signature (n_common, n_bonds)
-            sig = (n_common, n_bonds)
+            sig = (len(common_neighbors), n_bonds)
             signatures[sig] = signatures.get(sig, 0) + 1  # counter of same signature
         all_signatures.append(signatures)
     return all_signatures

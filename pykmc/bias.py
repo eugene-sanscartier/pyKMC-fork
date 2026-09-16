@@ -3,10 +3,10 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Literal
-import logging
 import numpy as np
 import pandas as pd
-from .log import fmt_hash
+from .log import fmt_hash, fmt_energy, fmt_distance, fmt_rate, fmt_time
+from . import log
 from .utils.geometry import minimum_image_vector
 
 if TYPE_CHECKING:
@@ -14,9 +14,6 @@ if TYPE_CHECKING:
     from .system import System
     from .atomic_environment import AtomicEnvironment
     from .neighbors_list import NeighborsList
-
-
-_LOGGER = logging.getLogger("log")
 
 
 class Bias(ABC):
@@ -174,16 +171,17 @@ class Bias(ABC):
             - float: total rate constant.
         """
         if not self.enabled:
-            _LOGGER.debug("\t :=> Bias disabled, using unbiased selection")
+            log.debug("Bias disabled, using unbiased selection", depth=1)
             return selection_algorithm(l_k)
         self.current_step += 1
-        _LOGGER.debug(
-            f"\n\t :=> Bias select: mode={self.mode},"
-            f" events={len(l_k)}, k_total={float(np.sum(l_k)):.6e}"
+        log.debug(
+            f"\nBias select: mode={self.mode},"
+            f" events={len(l_k)}, k_total={fmt_rate(float(np.sum(l_k)))}",
+            depth=1,
         )
         self._prepare(system, reference_table, atomic_environment, neighbors_list)
         if not self._step_is_active:
-            _LOGGER.debug("\t :=> Bias inactive on this step, using unbiased selection")
+            log.debug("Bias inactive on this step, using unbiased selection", depth=1)
             return selection_algorithm(l_k)
         match self.mode:
             case "filter":
@@ -232,26 +230,26 @@ class Bias(ABC):
                 else "?"
             )
             if self.accept(event, system, reference_table, neighbors_list):
-                _LOGGER.debug(
-                    f"\t\t :=> Filter: accepted event {idx}"
+                log.debug(
+                    f"Filter: accepted event {idx}"
                     f" (atom={event.get('atom_index', '?')},"
                     f" ref={num_ref},"
                     f" event_id={event_id},"
-                    f" Ea={event.get('dE_forward', float('nan')):.6f} eV,"
-                    f" k={float(l_k[idx]):.6e})"
+                    f" Ea={fmt_energy(event.get('dE_forward', float('nan')))},"
+                    f" k={fmt_rate(float(l_k[idx]))})",
+                    depth=2,
                 )
                 return idx, delta_t, ktot
-            _LOGGER.debug(
-                f"\t\t :=> Filter: rejected event {idx}"
+            log.debug(
+                f"Filter: rejected event {idx}"
                 f" (atom={event.get('atom_index', '?')},"
                 f" ref={num_ref},"
                 f" event_id={event_id},"
-                f" Ea={event.get('dE_forward', float('nan')):.6f} eV)"
+                f" Ea={fmt_energy(event.get('dE_forward', float('nan')))})",
+                depth=2,
             )
             candidate_events.remove(idx)
-        _LOGGER.debug(
-            "\t :=> Filter: all candidates rejected, using unbiased selection"
-        )
+        log.debug("Filter: all candidates rejected, using unbiased selection", depth=1)
         return selection_algorithm(l_k)
 
     def _select_boost(
@@ -277,21 +275,23 @@ class Bias(ABC):
         k_boost = l_k[desired_mask].sum()
         k_free = l_k[~desired_mask].sum()
         if k_boost == 0 or k_free == 0:
-            _LOGGER.debug(
-                f"\t :=> Boost: degenerate split"
-                f" (k_boost={float(k_boost):.6e}, k_free={float(k_free):.6e}),"
-                f" using unbiased selection"
+            log.debug(
+                f"Boost: degenerate split"
+                f" (k_boost={fmt_rate(float(k_boost))}, k_free={fmt_rate(float(k_free))}),"
+                f" using unbiased selection",
+                depth=1,
             )
             return selection_algorithm(l_k)
         alpha = max(
             1.0, self.bias_weight * k_free / ((1 - self.bias_weight) * k_boost)
         )
-        _LOGGER.debug(
-            f"\t :=> Boost: desired={int(np.count_nonzero(desired_mask))},"
+        log.debug(
+            f"Boost: desired={int(np.count_nonzero(desired_mask))},"
             f" undesired={int(np.count_nonzero(~desired_mask))},"
-            f" k_boost={float(k_boost):.6e}, k_free={float(k_free):.6e},"
+            f" k_boost={fmt_rate(float(k_boost))}, k_free={fmt_rate(float(k_free))},"
             f" bias_weight={float(self.bias_weight):.3f}, alpha={float(alpha):.6e}"
-            + (" (floored, desired already dominant)" if alpha == 1.0 else "")
+            + (" (floored, desired already dominant)" if alpha == 1.0 else ""),
+            depth=1,
         )
         for i in np.nonzero(desired_mask)[0]:
             row = active_table.table.loc[i]
@@ -301,12 +301,13 @@ class Bias(ABC):
                     "event_id"
                 ].values[0]
             )
-            _LOGGER.debug(
-                f"\t\t :=> Desired event: idx={int(i)},"
+            log.debug(
+                f"Desired event: idx={int(i)},"
                 f" atom_index={row.get('atom_index', '?')},"
                 f" reference_event={num_ref},"
-                f" Ea={row.get('dE_forward', float('nan')):.6f} eV,"
-                f" event_id={event_id}"
+                f" Ea={fmt_energy(row.get('dE_forward', float('nan')))},"
+                f" event_id={event_id}",
+                depth=2,
             )
         l_k_boosted = l_k.copy()
         l_k_boosted[desired_mask] *= alpha
@@ -321,12 +322,13 @@ class Bias(ABC):
             if len(ref_rows) > 0 and "event_id" in ref_rows.columns
             else "?"
         )
-        _LOGGER.debug(
-            f"\t :=> Boost: selected event {idx},"
+        log.debug(
+            f"Boost: selected event {idx},"
             f" event_id={event_id},"
-            f" Ea={selected_event.get('dE_forward', float('nan')):.6f} eV,"
-            f" corrected_delta_t={float(delta_t):.6e},"
-            f" true_k_total={float(k_total_true):.6e}"
+            f" Ea={fmt_energy(selected_event.get('dE_forward', float('nan')))},"
+            f" corrected_delta_t={fmt_time(float(delta_t))},"
+            f" true_k_total={fmt_rate(float(k_total_true))}",
+            depth=1,
         )
         return idx, delta_t, k_total_true
 
@@ -478,19 +480,21 @@ class DirectionBias(Bias):
             )
             projection = float(np.dot(displacement, self._direction))
             accepted = projection >= self._threshold
-            _LOGGER.debug(
-                f"\t\t :=> Direction bias: atom {atom_idx},"
+            log.debug(
+                f"Direction bias: atom {atom_idx},"
                 f" projection={projection:+.6e}, threshold={float(self._threshold):.6e},"
-                f" accepted={accepted}"
+                f" accepted={accepted}",
+                depth=2,
             )
             return accepted
         for atom_idx, displacement in self._biased_atom_displacements(
             event, system, neighbors_list
         ):
             projection = float(np.dot(displacement, self._direction))
-            _LOGGER.debug(
-                f"\t\t :=> Direction bias: atom {atom_idx},"
-                f" projection={projection:+.6e}, threshold={float(self._threshold):.6e}"
+            log.debug(
+                f"Direction bias: atom {atom_idx},"
+                f" projection={projection:+.6e}, threshold={float(self._threshold):.6e}",
+                depth=2,
             )
             if projection >= self._threshold:
                 return True
@@ -575,10 +579,11 @@ class PointBias(Bias):
                 event, system, neighbors_list, atom_idx
             )
             projection = float(np.dot(displacement, to_target / dist))
-            _LOGGER.debug(
-                f"\t\t :=> Point bias: atom {atom_idx},"
+            log.debug(
+                f"Point bias: atom {atom_idx},"
                 f" projection={projection:+.6e}, threshold={float(self._threshold):.6e},"
-                f" accepted={projection >= self._threshold}"
+                f" accepted={projection >= self._threshold}",
+                depth=2,
             )
             return projection >= self._threshold
         for atom_idx, displacement in self._biased_atom_displacements(
@@ -590,9 +595,10 @@ class PointBias(Bias):
             if dist < 1e-10:
                 return True
             projection = float(np.dot(displacement, to_target / dist))
-            _LOGGER.debug(
-                f"\t\t :=> Point bias: atom {atom_idx},"
-                f" projection={projection:+.6e}, threshold={float(self._threshold):.6e}"
+            log.debug(
+                f"Point bias: atom {atom_idx},"
+                f" projection={projection:+.6e}, threshold={float(self._threshold):.6e}",
+                depth=2,
             )
             if projection >= self._threshold:
                 return True
@@ -694,31 +700,35 @@ class TopoBias(Bias):
             if self._topo_target
             else 0
         )
-        _LOGGER.debug(
-            f"\t :=> Topo bias prepare: source_atoms={len(source_atoms)}, target_atoms={n_target}"
+        log.debug(
+            f"Topo bias prepare: source_atoms={len(source_atoms)}, target_atoms={n_target}",
+            depth=1,
         )
 
     def accept(self, event, system, reference_table, neighbors_list=None) -> bool:
         atom_idx = int(event["atom_index"])
         if atom_idx not in self._source_atoms:
-            _LOGGER.debug(
-                f"\t\t :=> Topo bias: atom {atom_idx} not in source topology,"
-                f" pass_unlisted={self.pass_unlisted}"
+            log.debug(
+                f"Topo bias: atom {atom_idx} not in source topology,"
+                f" pass_unlisted={self.pass_unlisted}",
+                depth=2,
             )
             return self.pass_unlisted
         displacement = self._get_displacement(event, system, neighbors_list, atom_idx)
         if self._direction is not None:
             projection = float(np.dot(displacement, self._direction))
             accepted = projection >= self._threshold
-            _LOGGER.debug(
-                f"\t\t :=> Topo bias: atom {atom_idx},"
+            log.debug(
+                f"Topo bias: atom {atom_idx},"
                 f" projection={projection:+.6e}, threshold={float(self._threshold):.6e},"
-                f" accepted={accepted}"
+                f" accepted={accepted}",
+                depth=2,
             )
             return accepted
         if self._target_positions is None:
-            _LOGGER.debug(
-                "\t :=> Topo bias: no target-topology atoms this step, inactive (accepted=True)"
+            log.debug(
+                "Topo bias: no target-topology atoms this step, inactive (accepted=True)",
+                depth=1,
             )
             return True
         current_pos = system.positions[atom_idx]
@@ -732,9 +742,10 @@ class TopoBias(Bias):
             for target in self._target_positions
         )
         accepted = final_min_dist < current_min_dist
-        _LOGGER.debug(
-            f"\t\t :=> Topo bias: atom {atom_idx},"
-            f" current_min_dist={current_min_dist:.6e}, final_min_dist={final_min_dist:.6e},"
-            f" accepted={accepted}"
+        log.debug(
+            f"Topo bias: atom {atom_idx},"
+            f" current_min_dist={fmt_distance(current_min_dist)}, final_min_dist={fmt_distance(final_min_dist)},"
+            f" accepted={accepted}",
+            depth=2,
         )
         return accepted

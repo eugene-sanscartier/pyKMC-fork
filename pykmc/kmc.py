@@ -33,7 +33,8 @@ from .result import (
     Ok,
     ShapeID,
 )
-from .log import fmt_hash
+from .log import fmt_hash, fmt_energy, fmt_rate, fmt_time, fmt_error
+from . import log
 import numpy as np
 from ase.io import write
 from ase import Atoms
@@ -53,7 +54,6 @@ from .info_simulation import (
 )
 from .eventsearch import EventSearch
 from .refinement import Refinement
-from .log import Colors
 from .otfml import OTFMLController, OTFMLStreamCheckpoint
 import time
 from .utils import push_towards, compute_delr_max
@@ -189,16 +189,11 @@ class KMC:
             )
 
         else:  # read restart file
-            self.loggers.info("log", ":=> Reading restart file")
+            log.info("Reading restart file")
             restart_info = np.load(self.params.control.restart_file)
             last_step = restart_info["last_step"]
             total_time = restart_info["last_time"]
-            self.loggers.info(
-                "log",
-                ":=> last step = {}, last_end_time = {}ps".format(
-                    last_step, total_time
-                ),
-            )
+            log.info(f"last step = {last_step}, last_end_time = {total_time}ps")
 
         # LOOP KMC PARAMETERS
         nkmc_steps = self.params.control.n_steps
@@ -214,23 +209,13 @@ class KMC:
             start_real = time.time()
             start_cpu = time.process_time()
 
-            self.loggers.info(
-                "log",
-                "{}{}Step : {}{}".format(
-                    Colors.BOLD.value, Colors.YELLOW.value, step, Colors.RESET.value
-                ),
-            )
+            log.header(f"Step : {step}")
 
             # == Find Current atomic environments that has not been visited ==
             new_shapes, atom_shapes = self.resolve_new_shapes()
 
             if self.params.control.recycle and len(self.active_table.table) > 0:
-                self.loggers.info(
-                    "log",
-                    "\t :=> Recycling {} events from the previous step".format(
-                        len(self.active_table.table)
-                    ),
-                )
+                log.info(f"Recycling {len(self.active_table.table)} events from the previous step", depth=1)
 
             # == FIND NEW GENERIC EVENTS ==
             if self.params.eventsearch.adaptive_search:
@@ -244,9 +229,10 @@ class KMC:
                 ) = self.adaptive_event_search(new_shapes)
             else:
                 ##=>List of atoms(central) on which we gonna perfom an event search
-                central_atom_research_list = self.central_atoms_research(
+                central_atom_research_list, dispatched_shapes = self.central_atoms_research(
                     new_shapes, nsearch
                 )
+                shape_by_atom = dict(zip(central_atom_research_list, dispatched_shapes))
 
                 ##=>Perform event search on each atom in central_atom_research_list
                 event_search = self.execute_event_searches(central_atom_research_list)
@@ -265,30 +251,25 @@ class KMC:
                         for r in search_results
                         if r.move_atom_index not in inactive_set
                     ]
-                results_is_valid_events = self.add_reference_events(search_results)
+                search_result_shapes = [shape_by_atom[r.central_atom_index] for r in search_results]
+                results_is_valid_events = self.add_reference_events(search_results, search_result_shapes)
                 shape_search_stats = None
                 all_search_results_for_info = event_search.results
                 # No Good-Turing estimate here, so no continuous credit
                 # mechanism -- each shape an actually-dispatched atom
                 # resolves to is simply marked completed, regardless of what
-                # was found (resolve_live_shape mints a shape backed by the
-                # atom's own geometry if this exact shape never matched
-                # anything, so a search that finds nothing is still marked
-                # complete instead of silently forgotten). A different shape
-                # sharing the same coarse id that never got a random draw
-                # this round stays unmarked, so it's picked up again by
-                # resolve_new_shapes() next step.
-                for atom_idx in central_atom_research_list:
-                    shape = self.reference_table.shapes.resolve_live_shape(
-                        self.system, self.neighbors_list, self.atomic_environment, atom_idx, mint=True
-                    )
+                # was found. A different shape sharing the same coarse id
+                # that never got a random draw this round stays unmarked, so
+                # it's picked up again by resolve_new_shapes() next step.
+                for shape, result in zip(dispatched_shapes, event_search.results):
+                    if not result.is_ok():
+                        self.reference_table.shapes.record_search_failure(shape)
                     self.reference_table.shapes.mark_shape_completed(shape)
 
             ##=>Close simulation if no events in the reference table
             if len(self.reference_table.table) == 0:
-                self.loggers.error(
-                    "log",
-                    "No events have been found, empty reference events table. \n \tTry to increase nsearch or saddle point search algorithm's parameters. \n \tClosing the simulation.",
+                log.error(
+                    "No events have been found, empty reference events table. \n \tTry to increase nsearch or saddle point search algorithm's parameters. \n \tClosing the simulation."
                 )
                 self._close()
 
@@ -311,12 +292,7 @@ class KMC:
             active_table = self.active_table
 
             active_table.remove_duplicates(self.neighbors_list)  # To be sure
-            self.loggers.info(
-                "log",
-                "\t :=> {} active events after removing duplicates.".format(
-                    len(active_table.table)
-                ),
-            )
+            log.info(f"{len(active_table.table)} active events after removing duplicates.", depth=1)
 
             # == Update System ==
             self.manager.use_global()
@@ -341,17 +317,11 @@ class KMC:
                 selected_topo = self.reference_table.table[
                     self.reference_table.table["idx_ref"] == num_ref_selected
                 ]["id_initial"].values[0]
-                self.loggers.info(
-                    "log",
-                    "\t :=> Removing reference event from which reconstruction failed.",
-                )
+                log.info("Removing reference event from which reconstruction failed.", depth=1)
                 self.reference_table.remove(
                     list(set(err_reference)), protect={num_ref_selected}
                 )
-                self.loggers.info(
-                    "log",
-                    "\t :=> Removing topology from known environments from which reconstruction failed.",
-                )
+                log.info("Removing topology from known environments from which reconstruction failed.", depth=1)
                 self.visited_environments = self.visited_environments.difference(
                     set(err_ae) - {selected_topo}
                 )
@@ -365,27 +335,50 @@ class KMC:
             # Pre-execution snapshot for event recycling (needed before update_positions below)
             if self.params.control.recycle:
                 self._pre_exec_configuration = self.system.configuration.copy()
+            # The reconstruction whose min2 the system lands on: the selected
+            # event's, unless a basin exit replaces it below.
+            executed = result_reconstruction
             # IF selected event shows we are in a basin
             if self.params.control.basin and detector.detect(
                 active_table.table.iloc[idx_selected_event],
-                self.reference_table.table,
+                self.reference_table,
                 self.params.basin.energy_thr,
                 is_refined=True,
             ):
-                self.loggers.info("log", "\t :=> System is in a Basin.")
-                self.loggers.info("log", "\t :=> Exploring the Basin.")
+                log.info("System is in a Basin.", depth=1)
+                if log.is_debug_enabled():
+                    triggering_row = active_table.table.iloc[idx_selected_event]
+                    log.debug(
+                        f"Basin trigger: atom={triggering_row['atom_index']},"
+                        f" dE_fwd={fmt_energy(triggering_row['dE_forward'])}"
+                        f" (thr={fmt_energy(self.params.basin.energy_thr)}),"
+                        f" ref_event={triggering_row['num_reference_event']},"
+                        f" k={fmt_rate(triggering_row['k'])}",
+                        depth=1,
+                    )
+                log.info("Exploring the Basin.", depth=1)
                 # get basin info/explore
                 basin = BasinsGenericEvents(
-                    self.params,
-                    self.reference_table,
-                    self.visited_environments,
-                    self.manager,
+                    self.params, self.reference_table, self.manager
                 )
                 self.system.update_positions(
                     result_reconstruction.ok_value().min1_configuration
                 )
                 result_basin = basin.execute(self.system)
                 if result_basin.is_ok():  # Basin did no fail
+                    if log.is_debug_enabled():
+                        basin_output = result_basin.ok_value()
+                        log.debug(
+                            f"Basin explored: {len(basin.states)} states,"
+                            f" {len(basin.connectivity_table.df)} transitions,"
+                            f" exit {basin_output.from_state}->{basin_output.exit_state}"
+                            f" (atom={basin_output.central_atom},"
+                            f" ref_event={basin_output.num_reference_event},"
+                            f" dE_fwd={fmt_energy(basin_output.dE_forward)},"
+                            f" k_tot={fmt_rate(basin_output.k_tot)},"
+                            f" t_exit={fmt_time(basin_output.t_exit)})",
+                            depth=1,
+                        )
                     # move system to a state connected to the exit_state
                     self.system.update_positions(
                         result_basin.ok_value().initial_system_configuration
@@ -418,12 +411,7 @@ class KMC:
                         0, tmp_active_table
                     )
                     if result_basin_reconstruction.is_ok():
-                        self.system.update_positions(
-                            result_basin_reconstruction.ok_value().min2_configuration
-                        )
-                        self.total_energy = (
-                            result_basin_reconstruction.ok_value().min2_etot
-                        )
+                        executed = result_basin_reconstruction
                         delta_t = result_basin.ok_value().t_exit
                         ktot = result_basin.ok_value().k_tot
                         idx_selected_event = 0
@@ -440,25 +428,15 @@ class KMC:
                         self.loggers.events_write("events", basin_info)
 
                     else:
-                        self.loggers.info(
-                            "log",
-                            "\t :=> Reconstruction Exit State Basin fails with error {}, back to original event".format(
-                                result_basin_reconstruction.err_value()
-                            ),
-                        )
-                        self.system.update_positions(basin.states[0].system.positions)
-                        self.system.update_positions(
-                            result_reconstruction.ok_value().min2_configuration
+                        log.info(
+                            f"Reconstruction Exit State Basin fails with error "
+                            f"{fmt_error(result_basin_reconstruction.err_value())}, back to original event",
+                            depth=1,
                         )
                 else:
-                    self.loggers.info(
-                        "log",
-                        "\t :=> Basin fails with error : {}, back to original event".format(
-                            result_basin.err_value()
-                        ),
-                    )
-                    self.system.update_positions(
-                        result_reconstruction.ok_value().min2_configuration
+                    log.info(
+                        f"Basin fails with error : {fmt_error(result_basin.err_value())}, back to original event",
+                        depth=1,
                     )
                 if basin.connectivity_table is not None:
                     basin.connectivity_table.save(
@@ -468,11 +446,10 @@ class KMC:
                 # prune below runs with the recycler detached).
                 prune_detach_recycler = True
             else:
-                self.system.update_positions(
-                    result_reconstruction.ok_value().min2_configuration
-                )
-                self.total_energy = result_reconstruction.ok_value().min2_etot
                 prune_detach_recycler = False
+
+            self.system.update_positions(executed.ok_value().min2_configuration)
+            self.total_energy = executed.ok_value().min2_etot
             total_time += delta_t * 10**-12  # time is in seconds
 
             ###=> Synchronise all lammps instances with new positions
@@ -502,13 +479,10 @@ class KMC:
             )
             self.loggers.info("info", kmc_loop_info.output_msg())
             if adaptive_search_info is not None and adaptive_search_info.n_capped > 0:
-                self.loggers.info(
-                    "log",
-                    "\t :=> WARNING: {} topolog{} hit the adaptive search ceiling "
-                    "without converging; may still have undiscovered events.".format(
-                        adaptive_search_info.n_capped,
-                        "y" if adaptive_search_info.n_capped == 1 else "ies",
-                    ),
+                log.warning(
+                    f"{adaptive_search_info.n_capped} topolog"
+                    f"{'y' if adaptive_search_info.n_capped == 1 else 'ies'} hit the adaptive search ceiling "
+                    "without converging; may still have undiscovered events."
                 )
 
             elapsed_real = time.time() - start_real
@@ -556,12 +530,7 @@ class KMC:
                     self.reference_table,
                 )
                 if self.params.control.recycle:
-                    self.loggers.info(
-                        "log",
-                        "\t :=> {} events flagged for recycling".format(
-                            len(self.active_table.table)
-                        ),
-                    )
+                    log.info(f"{len(self.active_table.table)} events flagged for recycling", depth=1)
 
             # == Update variables ==
             self.neighbors_list = NeighborsList(
@@ -572,12 +541,7 @@ class KMC:
             )
             n_stale = self.active_table.drop_stale_rows(self.neighbors_list)
             if n_stale:
-                self.loggers.info(
-                    "log",
-                    "\t :=> Dropped {} recycled events whose atomic environment changed.".format(
-                        n_stale
-                    ),
-                )
+                log.info(f"Dropped {n_stale} recycled events whose atomic environment changed.", depth=1)
             self.atomic_environment = AtomicEnvironment(
                 self.params.atomicenvironment.style,
                 self.neighbors_list.neighbors_list["rnei"],
@@ -614,7 +578,7 @@ class KMC:
             if set(list(self.atomic_environment.atomic_environment_list)) == {
                 "crystal"
             }:
-                self.loggers.info("log", ":=> Only atoms with cristalline environment")
+                log.info("Only atoms with cristalline environment")
                 self._close()
         self._save_restart_file(step, total_time)
         self._close()
@@ -664,20 +628,17 @@ class KMC:
                 self.system, self.neighbors_list, self.atomic_environment, atom_idx, mint=True
             )
             atom_shapes[atom_idx] = shape
-            if self.reference_table.shapes.get_shape_knowledge(shape).status == "completed":
+            if not self.reference_table.shapes.needs_search(shape):
                 continue
             eligible[shape] = eligible.get(shape, []) + [atom_idx]
 
-        self.loggers.info(
-            "log",
-            "\t :=> {} shapes need a fresh search".format(len(eligible)),
-        )
+        log.info(f"{len(eligible)} shapes need a fresh search", depth=1)
         return eligible, atom_shapes
 
     def central_atoms_research(
         self, new_shapes: dict[ShapeID, list[int]], nsearch: int
-    ) -> list[int]:
-        """Generate list of central atoms on which we gonna perform generic event searches for the reference table.
+    ) -> tuple[list[int], list[ShapeID]]:
+        """Generate the central atoms on which we gonna perform generic event searches for the reference table.
 
         For each new shape it adds nseach atoms having that shape to the list.
 
@@ -691,7 +652,11 @@ class KMC:
         Returns
         -------
         list[int]
-            List of central atoms
+            List of central atoms.
+        list[ShapeID]
+            The shape each atom in the first list was drawn for -- same
+            length/order, so callers know which shape a given dispatched
+            search belongs to without re-resolving it live afterward.
 
         Raises
         ------
@@ -700,19 +665,21 @@ class KMC:
 
         """
         central_atom_research_list = []
+        dispatched_shapes = []
         inactive_set = (
             set(self.inactive_ae.get_atoms_with_id("in"))
             if self.inactive_ae is not None
             else set()
         )
-        for atoms in new_shapes.values():
+        for shape, atoms in new_shapes.items():
             tmp1 = [i for i in atoms if i not in inactive_set] if inactive_set else atoms
             if not tmp1:
                 continue  # no eligible atoms for this environment
             # Randomly choose nsearch atoms that have that environment
             tmp2 = [random.choice(tmp1) for _i in range(nsearch)]
             central_atom_research_list += tmp2
-        return central_atom_research_list
+            dispatched_shapes += [shape] * nsearch
+        return central_atom_research_list, dispatched_shapes
 
     def execute_event_searches(
         self, central_atom_research_list: list[int]
@@ -734,14 +701,13 @@ class KMC:
             self.params,
             self.system,
             self.manager,
-            self.loggers,
         )
         event_search.execute(central_atom_research_list)
         self.otfml.retry_extrapolating("search", event_search)
         return event_search
 
     def add_reference_events(
-        self, events: list[EventSearchOutput]
+        self, events: list[EventSearchOutput], dispatched_shapes: list[ShapeID]
     ) -> list[pd.DataFrame]:
         """Add events to the reference table.
 
@@ -749,6 +715,11 @@ class KMC:
         ----------
         events : list[EventSearchOutput]
             List containing EventSearchOutput dataclass of successful events.
+        dispatched_shapes : list[ShapeID]
+            The shape each event's own search was dispatched for, same
+            length/order as `events` -- lets a rejected event (no catalogued
+            owner to attribute it to) still be logged against the shape that
+            spent the search on it.
 
         Returns
         -------
@@ -756,12 +727,10 @@ class KMC:
             List of event dataframe that has been added to the reference event table.
 
         """
-        results_is_valid_events = self.reference_table.add_events(events)
-        self.loggers.info(
-            "log",
-            "\t :=> Adding {} events to the reference table".format(
-                len([e for e in results_is_valid_events if e.is_ok()])
-            ),
+        results_is_valid_events = self.reference_table.add_events(events, dispatched_shapes)
+        log.info(
+            f"Adding {len([e for e in results_is_valid_events if e.is_ok()])} events to the reference table",
+            depth=1,
         )
         return results_is_valid_events
 
@@ -825,7 +794,7 @@ class KMC:
                 continue
             atoms_by_shape[shape] = atoms
 
-        event_search = EventSearch(self.params, self.system, self.manager, self.loggers)
+        event_search = EventSearch(self.params, self.system, self.manager)
         pool_size = len(self.manager.sessions)
         otfml_checkpoint = OTFMLStreamCheckpoint(self.otfml, "search", pool_size)
 
@@ -846,7 +815,7 @@ class KMC:
             if inactive_set and output.move_atom_index in inactive_set:
                 return
             all_search_results.append(output)
-            valid_result = self.add_reference_events([output])[0]
+            valid_result = self.add_reference_events([output], [shape])[0]
             all_valid_results.append(valid_result)
 
             # The shape is resolved fresh here (rather than reused from
@@ -867,15 +836,13 @@ class KMC:
             result = event_search.results[task.task_id]
             if result.is_ok():
                 credit_result(shape, result.ok_value())
+            else:
+                self.reference_table.shapes.record_search_failure(shape)
             if session.advance_one(shape, params):
-                self.loggers.info(
-                    "log",
-                    "\t :=> Adaptive search: shape {}#{} still unconverged past half its "
-                    "budget, escalating toward the cap ({} searches).".format(
-                        fmt_hash(shape.id),
-                        shape.sid,
-                        params.eventsearch.adaptive_max_searches,
-                    ),
+                log.info(
+                    f"Adaptive search: shape {fmt_hash(shape.id)}#{shape.sid} still unconverged past half its "
+                    f"budget, escalating toward the cap ({params.eventsearch.adaptive_max_searches} searches).",
+                    depth=1,
                 )
 
         while True:
@@ -899,7 +866,10 @@ class KMC:
             else:
                 break
 
-        session.finalize(self.reference_table.shapes.mark_shape_completed)
+        session.finalize(
+            self.reference_table.shapes.mark_shape_completed,
+            self.reference_table.shapes.record_adaptive_outcome,
+        )
         search_result = AdaptiveSearchResult(
             all_search_results, list(event_search.results), all_valid_results, session.stats
         )
@@ -1034,7 +1004,6 @@ class KMC:
         )
         refinement = Refinement(
             self.params,
-            self.loggers,
             self.system,
             self.neighbors_list,
             self.manager,
@@ -1115,19 +1084,17 @@ class KMC:
             ##=>Select event
             idx_selected_event, delta_t, ktot = self._select_event(active_table)
             selected_event = active_table.table.loc[idx_selected_event]
-            self.loggers.info(
-                "log",
-                (
-                    "\n\t :=> Selected event context: "
-                    f"idx={idx_selected_event}, "
-                    f"atom_index={selected_event.at['atom_index']}, "
-                    f"reference_event={selected_event.at['num_reference_event']}, "
-                    f"k={selected_event.at['k']:.6e}, "
-                    f"Ea={selected_event.at['dE_forward']:.6f} eV"
-                ),
+            log.info(
+                "\nSelected event context: "
+                f"idx={idx_selected_event}, "
+                f"atom_index={selected_event.at['atom_index']}, "
+                f"reference_event={selected_event.at['num_reference_event']}, "
+                f"k={fmt_rate(selected_event.at['k'])}, "
+                f"Ea={fmt_energy(selected_event.at['dE_forward'])}",
+                depth=1,
             )
             ##=>Reconstruct event
-            self.loggers.info("log", "\t :=> Event Reconstruction")
+            log.info("Event Reconstruction", depth=1)
             result_reconstruction = self._reconstruction_active_event(
                 idx_selected_event, active_table
             )
@@ -1138,9 +1105,10 @@ class KMC:
                 event_id = self.reference_table.table[
                     self.reference_table.table["idx_ref"] == num_ref_event
                 ]["event_id"].values[0]
-                self.loggers.info(
-                    "log",
-                    f"\t :=> Reconstruction succeeded (reference event {num_ref_event}, event_id={fmt_hash(event_id)}, Ea={selected_event.at['dE_forward']:.6f} eV).",
+                log.info(
+                    f"Reconstruction succeeded (reference event {num_ref_event},"
+                    f" event_id={fmt_hash(event_id)}, Ea={fmt_energy(selected_event.at['dE_forward'])}).",
+                    depth=1,
                 )
                 break
             else:
@@ -1148,13 +1116,9 @@ class KMC:
                     "num_reference_event"
                 ]
                 err = result_reconstruction.err_value()
-                err_type = getattr(err, "type", "UNKNOWN")
-                self.loggers.info(
-                    "log",
-                    (
-                        f"\t :=> Reconstruction fails (reference event {num_ref_event}) "
-                        f"[type={err_type}] : {err.message}"
-                    ),
+                log.info(
+                    f"Reconstruction fails (reference event {num_ref_event}) {fmt_error(err)}",
+                    depth=1,
                 )
                 ae_topo = self.reference_table.table[
                     self.reference_table.table["idx_ref"] == num_ref_event
@@ -1162,10 +1126,10 @@ class KMC:
                 err_reference += [num_ref_event]
                 err_ae += [ae_topo]
 
-                self.loggers.info("log", "\t :=> Removing active event.")
+                log.info("Removing active event.", depth=1)
                 active_table.remove(idx_selected_event)
         else:
-            self.loggers.error("log", "All event reconstuctions failed.")
+            log.error("All event reconstuctions failed.")
             self._close()
 
         return (
@@ -1236,9 +1200,9 @@ class KMC:
     def _minimize_system_once(self, configuration: Configuration) -> None:
         """Perform a single minimization without OTF retry handling."""
         if self.params.control.restart_file is None:
-            self.loggers.info("log", ":=> Minimizing the system")
+            log.info("Minimizing the system")
         else:
-            self.loggers.info("log", ":=> Computing energies")
+            log.info("Computing energies")
         if self.otfml.is_enabled_for_phase("minimize"):
             self.manager.global_reset_otf_flags()
         new_configuration, total_energy = self.manager.global_minimize_with_results(
@@ -1395,6 +1359,6 @@ class KMC:
 
     def _close(self) -> None:
         """Close the simulation."""
-        self.loggers.info("log", ":=> End of simulation")
+        log.info("End of simulation")
         self.manager.close_all()
         sys.exit()

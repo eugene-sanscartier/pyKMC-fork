@@ -5,7 +5,8 @@ import logging
 from .result import ErrorInfo, EventSearchOutput, Result, SearchTask
 from .system import System
 from .enginemanager.lmpi.pool import Manager
-from .log import LogKMC
+from .log import fmt_energy, fmt_error
+from . import log
 from .utils.geometry import translate
 import numpy as np
 
@@ -19,8 +20,6 @@ class EventSearch:
         The atomic system.
     engine : Engine
         The engine used to perform the event search.
-    loggers : LogKMC
-        The KMC simulation loggers.
 
     """
 
@@ -29,12 +28,10 @@ class EventSearch:
         params,
         system: System,
         manager: Manager,
-        loggers: LogKMC,
     ) -> None:
         self.params = params
         self.system = system
         self.manager = manager
-        self.loggers = loggers
         self.results = []
         self.tasks = []
         self._pending: dict[concurrent.futures.Future, SearchTask] = {}
@@ -51,10 +48,6 @@ class EventSearch:
 
         """
         tasks = self.build_tasks(central_atom_research_list)
-        self.loggers.info(
-            "log",
-            f"\t :=> Searching {len(tasks)} reference events",
-        )
         self.tasks = tasks
         self.results = [None] * len(tasks)
         for task_id, result in self._run_tasks(tasks).items():
@@ -72,7 +65,10 @@ class EventSearch:
         try:
             result = future.result()
         except Exception as exc:
-            self.loggers.error("log", f"\t task {task.task_id:5d} | atom {task.central_atom_index:6d} | {'RAISE':<5} type={type(exc).__name__}")
+            log.status(
+                f"task {task.task_id:5d} | atom {task.central_atom_index:6d}", "RAISE",
+                f"type={type(exc).__name__}", level=logging.ERROR,
+            )
             raise
         self._log_task_result(task, result)
         return result
@@ -93,10 +89,12 @@ class EventSearch:
         }
 
         run_results = {}
-        for i, future in enumerate(concurrent.futures.as_completed(future_to_task)):
+        for future in log.progress(
+            concurrent.futures.as_completed(future_to_task), len(tasks), label="Searching events",
+            reflow=1,
+        ):
             task = future_to_task[future]
             run_results[task.task_id] = self._resolve(future, task)
-            self.loggers.progress_bar("progress", i + 1, len(tasks))
         return run_results
 
     def submit(self, central_atom_index: int) -> concurrent.futures.Future:
@@ -153,47 +151,25 @@ class EventSearch:
         self, task: SearchTask, result: Result[EventSearchOutput, ErrorInfo]
     ) -> None:
         """Temporary debug logging for per-search outcomes."""
-        if not self.loggers.is_enabled_for("log", logging.DEBUG):
+        if not log.is_debug_enabled():
             return
 
-        prefix = f"\t task {task.task_id:5d} | atom {task.central_atom_index:6d}"
+        prefix = f"task {task.task_id:5d} | atom {task.central_atom_index:6d}"
         if result.is_ok():
             output = result.ok_value()
-            self.loggers.debug(
-                "log",
-                f"{prefix} | {'OK':<5} dE_fwd={output.dE_forward:.4f} eV  dE_bwd={output.dE_backward:.4f} eV  move_atom={output.move_atom_index:6d}",
+            log.status(
+                prefix, "OK",
+                f"dE_fwd={fmt_energy(output.dE_forward)}  dE_bwd={fmt_energy(output.dE_backward)}  move_atom={output.move_atom_index:6d}",
             )
             return
 
-        error = result.err_value()
-        parts = [
-            f"type={error.type.name}",
-        ]
-        if error.details is not None:
-            parts.append(f"details={error.details}")
-        if error.variables:
-            vars_str = ", ".join(
-                f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
-                for k, v in error.variables.items()
-            )
-            parts.append(f"variables=({vars_str})")
-
-        self.loggers.debug(
-            "log",
-            f"{prefix} | {'FAIL':<5} {', '.join(parts)}",
-        )
+        log.status(prefix, "FAIL", fmt_error(result.err_value()))
 
     def retry(self, retry_task_ids: list[int]) -> None:
         """Rerun only the requested event-search tasks."""
         rerun_tasks = [self.tasks[task_id] for task_id in retry_task_ids]
         for task_id, result in self._run_tasks(rerun_tasks).items():
             self.results[task_id] = result
-        # for i, at_idx in enumerate(central_atom_research_list):
-        #    event_search_output = self.engine.search_event(self.system, at_idx)
-        #    self.results.append(event_search_output)
-        #    self.loggers.progress_bar(
-        #        "progress", i + 1, len(central_atom_research_list)
-        #    )
 
     def _center_event_positions(
         self, event_search_output: EventSearchOutput

@@ -67,29 +67,38 @@ class NeighborsList:
             max(self.rnei, *self.rnei_pairs.values()) if self.rnei_pairs else self.rnei
         )
 
-        # Find first neighbors and atoms in environments.
-        # query_ball_point leaves single-point results unsorted, and its order
+        indices = self.atom_indices if self.atom_indices is not None else range(len(positions))
+        indices = np.asarray(indices, dtype=int)
+        query_positions = positions[indices]
+
+        # Find first neighbors and atoms in environments. One query per cutoff
+        # for every atom at once: the per-atom call is the same search, and
+        # issuing it 2N times from Python costs several times the search
+        # itself.
+        # query_ball_point leaves each atom's result unsorted, and its order
         # depends on the whole position array, so an unrelated atom moving can
         # reorder an untouched atom's list. Positions stored against a list are
         # applied back positionally, so the order has to be reproducible.
-        indices = self.atom_indices if self.atom_indices is not None else range(len(positions))
-        for i in indices:
-            neighbors = sorted(tree.query_ball_point(positions[i], query_rnei))
-            neighbors.remove(i)  # don't have self as neighbor
+        found_rnei = tree.query_ball_point(query_positions, query_rnei, workers=-1)
+        for i, found in zip(indices, found_rnei):
+            atom_idx = int(i)
+            neighbors = sorted(found)
+            neighbors.remove(atom_idx)  # don't have self as neighbor
             if self.rnei_pairs:
-                delta = positions[neighbors] - positions[i]
+                delta = positions[neighbors] - positions[atom_idx]
                 delta -= box_arr * np.round(delta / box_arr)
                 distances = np.linalg.norm(delta, axis=1)
                 neighbors = [
                     j
                     for j, d in zip(neighbors, distances)
-                    if d <= self._pair_rnei(i, j)
+                    if d <= self._pair_rnei(atom_idx, j)
                 ]
-            self.neighbors_list["rnei"][i] = neighbors
-            if self.rcut is not None:
-                self.neighbors_list["rcut"][i] = sorted(
-                    tree.query_ball_point(positions[i], self.rcut)
-                )
+            self.neighbors_list["rnei"][atom_idx] = neighbors
+
+        if self.rcut is not None:
+            found_rcut = tree.query_ball_point(query_positions, self.rcut, workers=-1)
+            for i, found in zip(indices, found_rcut):
+                self.neighbors_list["rcut"][int(i)] = sorted(found)
 
     def get_neighbors(self, cutoff_type: float, idx: int) -> list[int]:
         """Retrieve the neighbor list for a specific atom and cutoff.

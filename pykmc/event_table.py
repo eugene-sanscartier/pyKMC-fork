@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import logging
 import pandas as pd
 from .rate_constant import compute_rate_Eyring
 from .parameters import Parameters
@@ -28,9 +27,7 @@ from .result import (
 from .point_set_registration import simple_ira, check_match
 from .utils.geometry import compute_delr_max, minimum_image_distance, unwrap_around
 from .shape_table import ShapeTable
-
-
-_LOGGER = logging.getLogger("log")
+from . import log
 
 
 if TYPE_CHECKING:
@@ -53,7 +50,7 @@ class ReferenceEventTable:
         self.shapes = ShapeTable(params)
 
     def add_events(
-        self, events: list[EventSearchOutput]
+        self, events: list[EventSearchOutput], dispatched_shapes: list[ShapeID]
     ) -> Result[pd.DataFrame, ErrorInfo]:
         """Events events to the table dataframe.
 
@@ -61,6 +58,9 @@ class ReferenceEventTable:
         ----------
         events : list[EventSearchOutput]
             list of EventSearchOutput dataclass with events to be added to the table dataframe.
+        dispatched_shapes : list[ShapeID]
+            The shape each event's own search was dispatched for, same
+            length/order as `events` -- see `_record_knowledge_from_result`.
 
         Returns
         -------
@@ -70,7 +70,7 @@ class ReferenceEventTable:
         """
         results_is_valid_events = []
         # Check if the event is valid based on is_valid_new_event conditions
-        for ev in events:
+        for ev, dispatched_shape in zip(events, dispatched_shapes):
             res = self.is_valid_new_event(
                 min1=ev.min1,
                 saddle=ev.saddle,
@@ -82,7 +82,7 @@ class ReferenceEventTable:
             results_is_valid_events.append(res)
             if res.is_ok():
                 self.add(res.ok_value())
-            self._record_knowledge_from_result(res)
+            self._record_knowledge_from_result(res, dispatched_shape)
         # df_valid_events = self.get_valid_events(results_is_valid_events)
 
         # Check if events in results are not the same :
@@ -93,32 +93,35 @@ class ReferenceEventTable:
         return results_is_valid_events
 
     def _record_knowledge_from_result(
-        self, res: Result[pd.DataFrame, ErrorInfo]
+        self, res: Result[pd.DataFrame, ErrorInfo], dispatched_shape: ShapeID
     ) -> None:
         """Update persistent per-`ShapeID` knowledge from one `is_valid_new_event` outcome.
 
-        Only outcomes that reach the duplicate-vs-new decision -- `Ok`
-        (a genuinely new forward+backward pair) or `Err(EVENT_NOT_NEW)` (a
-        rediscovered forward match) -- carry any knowledge; energy/asymmetry/
-        not-distinct rejections are not a sighting of any shape's event
-        population and are ignored here, mirroring
-        `pykmc.adaptive_search.record_draw`'s exclusion.
+        `Ok` (a genuinely new forward+backward pair) and `Err(EVENT_NOT_NEW)`
+        (a rediscovered forward match) are logged against whichever shape the
+        row itself belongs to -- not necessarily `dispatched_shape`, since a
+        disconnected/opportunistic discovery can belong to a different shape
+        than the one actually searched. Any other rejection (energy/
+        asymmetry/not-distinct) has no such row to attribute to, so it is
+        logged as a bare failure against `dispatched_shape` instead -- the
+        only shape a search that found nothing usable can be charged to.
 
         Called unconditionally, regardless of which atom's search produced
-        `res` or whether its shape has an open per-step session -- this is
-        what lets a disconnected/opportunistic discovery still update the
-        record for whichever shape it actually belongs to.
+        `res` or whether its shape has an open per-step session.
         """
         if res.is_ok():
             added = res.ok_value()
             for _, row in added.iterrows():
                 self.shapes.record_shape_knowledge(
-                    row["id_initial"], int(row["sid_initial"]), int(row["idx_ref"]), float(row["k"])
+                    row["id_initial"], int(row["sid_initial"]), int(row["idx_ref"]), float(row["k"]),
+                    float(row["dE_forward"]), float(row["dE_backward"]),
+                    outcome="new",
                 )
             return
 
         err = res.err_value()
         if err.type is not ErrorType.EVENT_NOT_NEW:
+            self.shapes.record_search_failure(dispatched_shape)
             return
         matched_idx_ref = err.variables["matched_idx_ref"]
         match = self.table.loc[self.table["idx_ref"] == matched_idx_ref]
@@ -128,6 +131,9 @@ class ReferenceEventTable:
                 int(match.iloc[0]["sid_initial"]),
                 int(matched_idx_ref),
                 float(match.iloc[0]["k"]),
+                float(match.iloc[0]["dE_forward"]),
+                float(match.iloc[0]["dE_backward"]),
+                outcome="duplicate",
             )
 
     def resolve_forward_and_backward_rows(
@@ -318,8 +324,9 @@ class ReferenceEventTable:
                     )
                 )
 
-    def _rows_with_shape(
-        self, df: pd.DataFrame, id_column: str, sid_column: str, shape: ShapeID | SaddleID
+    @staticmethod
+    def rows_with_shape(
+        df: pd.DataFrame, id_column: str, sid_column: str, shape: ShapeID | SaddleID
     ) -> pd.DataFrame:
         """Rows of `df` whose `(id_column, sid_column)` pair equals `shape`."""
         return df[(df[id_column] == shape.id) & (df[sid_column] == shape.sid)]
@@ -342,7 +349,7 @@ class ReferenceEventTable:
         # Coarse topology pre-filter, narrowed to the specific initial
         # ShapeID; the sid_saddle check below decides true pathway-level
         # duplication within that ShapeID:
-        subset = self._rows_with_shape(
+        subset = self.rows_with_shape(
             self.table,
             "id_initial",
             "sid_initial",
@@ -362,7 +369,7 @@ class ReferenceEventTable:
         # _build_event_series() (via resolve_sid("saddle", ...)) before this method
         # was ever called -- reuse that instead of re-deriving it with a
         # second IRA pass over every row in subset.
-        matches = self._rows_with_shape(
+        matches = self.rows_with_shape(
             subset,
             "id_saddle",
             "sid_saddle",
@@ -1042,18 +1049,14 @@ class ActiveEventTable:
         unique_duplicates = sorted(set(duplicates))
         if unique_duplicates:
             self.remove(unique_duplicates)
-            _LOGGER.info(
-                "\t :=> Removed %d duplicate active events (central=%d, symmetric=%d).",
-                len(unique_duplicates),
-                len(set(duplicates_central)),
-                len(set(duplicates_symmetric)),
+            log.info(
+                f"Removed {len(unique_duplicates)} duplicate active events"
+                f" (central={len(set(duplicates_central))}, symmetric={len(set(duplicates_symmetric))}).",
+                depth=1,
             )
-            _LOGGER.info(
-                "\t :=> Duplicate active event indices removed: %s",
-                unique_duplicates,
-            )
+            log.info(f"Duplicate active event indices removed: {unique_duplicates}", depth=1)
         else:
-            _LOGGER.info("\t :=> No duplicate active events detected.")
+            log.info("No duplicate active events detected.", depth=1)
 
     def save(self, outfile: str = "active_table.pickle") -> None:
         """Save the reference event table to a pickle file.

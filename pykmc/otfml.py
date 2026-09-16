@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 from typing import TYPE_CHECKING, Callable
 from .result import ErrorType
+from . import log
 
 if TYPE_CHECKING:
     from .kmc import KMC
@@ -98,12 +99,7 @@ class OTFMLController:
             retry_task_ids = collect_fn()
             if not retry_task_ids:
                 return
-            self._log(
-                "log",
-                "\t :=> OTFML retry cycle {} for {} jobs in phase '{}'.".format(
-                    cycle + 1, len(retry_task_ids), phase
-                ),
-            )
+            log.info(f"OTFML retry cycle {cycle + 1} for {len(retry_task_ids)} jobs in phase '{phase}'.", depth=1)
             self._retrain_and_reload()
             self.kmc._minimize_system_once(configuration=self.kmc.system.configuration)
             retry_fn(retry_task_ids)
@@ -121,11 +117,9 @@ class OTFMLController:
         while True:
             if not flags.extrapolated:
                 return
-            self._log(
-                "log",
-                "\t :=> OTFML detected minimization extrapolation{}.".format(
-                    " above gamma_max" if flags.extreme_extrapolated else ""
-                ),
+            log.info(
+                f"OTFML detected minimization extrapolation{' above gamma_max' if flags.extreme_extrapolated else ''}.",
+                depth=1,
             )
             self._retrain_and_reload()
             flags = self._coerce_flags(minimize_once())
@@ -164,7 +158,7 @@ class OTFMLController:
 
     def _retrain_and_reload(self) -> None:
         full_command = self._build_retrain_command()
-        self._log("log", "\t :=> OTFML retraining command: {}".format(full_command))
+        log.info(f"OTFML retraining command: {full_command}", depth=1)
         # does nothing for now
         # clean_env = {k: v for k, v in os.environ.items() if not any(k.startswith(p) for p in self._MPI_PREFIXES)}
 
@@ -172,15 +166,12 @@ class OTFMLController:
             result = subprocess.run(full_command, shell=True)
         if result.returncode == 67:
             self._consecutive_failed_retrain_exit += 1
-            self._log(
-                "log",
-                f"\t :=> Retraining exited with code 67 ({self._consecutive_failed_retrain_exit}/5 consecutive)",
+            log.info(
+                f"Retraining exited with code 67 ({self._consecutive_failed_retrain_exit}/5 consecutive)",
+                depth=1,
             )
             if self._consecutive_failed_retrain_exit > 5:
-                self._log(
-                    "log",
-                    "Retraining returned exit code 67 more than 5 times in a row; aborting.",
-                )
+                log.info("Retraining returned exit code 67 more than 5 times in a row; aborting.")
                 self.kmc._close()
         else:
             self._consecutive_failed_retrain_exit = 0
@@ -205,10 +196,6 @@ class OTFMLController:
         if isinstance(value, OTFExtrapolationFlags):
             return value
         return OTFExtrapolationFlags()
-
-    def _log(self, logger_name: str, message: str) -> None:
-        if getattr(self.kmc, "loggers", None) is not None:
-            self.kmc.loggers.info(logger_name, message)
 
 
 class OTFMLStreamCheckpoint:

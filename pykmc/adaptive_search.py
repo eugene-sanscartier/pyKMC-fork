@@ -607,7 +607,11 @@ class AdaptiveSearchSession:
             self.open_shapes.discard(shape)
         return not was_escalated and stats.escalated
 
-    def finalize(self, mark_completed: Callable[[ShapeID], None]) -> None:
+    def finalize(
+        self,
+        mark_completed: Callable[[ShapeID], None],
+        record_outcome: Callable[..., None],
+    ) -> None:
         """Write back terminal per-shape outcomes to the persistent record.
 
         Call once the dispatch loop has fully drained (`open_shapes`
@@ -618,13 +622,17 @@ class AdaptiveSearchSession:
         persistent status untouched, so the shape is reconsidered whenever
         it does become live/dispatchable.
 
-        `mark_completed` (typically `ShapeTable.mark_shape_completed`) is
-        taken as a callback rather than the raw `shape_knowledge` dict so
-        this module never has to touch that dict's representation directly.
+        `mark_completed` (typically `ShapeTable.mark_shape_completed`) and
+        `record_outcome` (typically `ShapeTable.record_adaptive_outcome`) are
+        taken as callbacks rather than the raw `shape_knowledge` dict so this
+        module never has to touch that dict's representation directly.
         """
         for shape, stats in self.stats.items():
             if stats.state in ("converged", "capped"):
                 mark_completed(shape)
+                record_outcome(
+                    shape, state=stats.state, escalated=stats.escalated, final_fraction=stats.last_fraction
+                )
 
 
 class AdaptiveSearchResult(NamedTuple):

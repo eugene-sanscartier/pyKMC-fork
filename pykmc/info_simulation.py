@@ -50,7 +50,7 @@ def info_atomic_environments(
         ),
         n_new_shapes=len(new_shapes),
     )
-    if kmc.params.control.verbosity == 2:
+    if kmc.params.control.verbosity >= 2:
         atom_group = {}
         for index, item in enumerate(kmc.atomic_environment.atomic_environment_list):
             if item != "crystal":

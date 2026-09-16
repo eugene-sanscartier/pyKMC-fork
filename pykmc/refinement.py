@@ -1,5 +1,6 @@
 """Module implementing the Refinement class that deals with the event refinement procedure."""
 
+import logging
 from dataclasses import dataclass, field
 
 from .result import (
@@ -18,7 +19,7 @@ from .utils import geometry
 from .parameters import Parameters
 from .system import System, Configuration
 from .neighbors_list import NeighborsList
-from .log import LogKMC
+from . import log
 from .enginemanager.lmpi.pool import Manager
 import numpy as np
 import concurrent.futures
@@ -43,8 +44,6 @@ class Refinement:
     ----------
     params : Parameters
         The configuration of the simulation.
-    loggers : LogKMC
-        The logger of the KMC simulation.
     system : System
         The atomic system.
     neighbors_list : NeighborsList
@@ -57,13 +56,11 @@ class Refinement:
     def __init__(
         self,
         params: Parameters,
-        loggers: LogKMC,
         system: System,
         neighbors_list: NeighborsList,
         manager: Manager,
     ) -> None:
         self.params = params
-        self.loggers = loggers
         self.system = system
         self.neighbors_list = neighbors_list
         self.manager = manager
@@ -84,7 +81,6 @@ class Refinement:
 
         """
         tasks = self.build_tasks(candidates)
-        self.loggers.info("log", "\t :=> Refining {} events".format(len(tasks)))
         self.tasks = tasks
         self.results = [None] * len(tasks)
         for task_id, result in self._run_tasks(tasks).items():
@@ -120,23 +116,28 @@ class Refinement:
             return {}
 
         future_to_prepared = {}
-        for task in tasks:
+        for task in log.progress(
+            tasks, len(tasks), label="Preparing refinements",
+            reflow=2,
+        ):
             prepared = self._prepare_task(task)
             future = self._submit_task(prepared)
             future_to_prepared[future] = prepared
 
         run_results = {}
-        for i, future in enumerate(concurrent.futures.as_completed(future_to_prepared)):
+        for future in log.progress(
+            concurrent.futures.as_completed(future_to_prepared), len(tasks), label="Refining events",
+            reflow=1,
+        ):
             prepared = future_to_prepared[future]
             try:
                 res = future.result()
             except Exception as exc:
-                self.loggers.error(
-                    "log",
-                    f"\n\t task {prepared.task.task_id:5d} | atom {prepared.task.central_atom_index:6d} | {'RAISE':<5} type={type(exc).__name__}",
+                log.status(
+                    f"task {prepared.task.task_id:5d} | atom {prepared.task.central_atom_index:6d}", "RAISE",
+                    f"type={type(exc).__name__}", level=logging.ERROR,
                 )
                 raise
-            self.loggers.progress_bar("progress", i + 1, len(tasks))
             run_results[prepared.task.task_id] = self._finalize_result(res, prepared)
         return run_results
 
