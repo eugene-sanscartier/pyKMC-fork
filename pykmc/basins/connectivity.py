@@ -108,7 +108,11 @@ class StatesConnectivity:
             self.df = pd.concat([self.df, new_row], ignore_index=True)
 
     def get_transition_to_state(
-        self, target_state: int, as_tuples: bool = True, return_all: bool = False
+        self,
+        target_state: int,
+        as_tuples: bool = True,
+        return_all: bool = False,
+        only_exits: bool = False,
     ) -> tuple | list[tuple] | pd.DataFrame:
         """Return the transition(s) leading to the specified target state.
 
@@ -127,6 +131,12 @@ class StatesConnectivity:
         return_all : bool, optional (default=False)
             If True, return all possible transitions to `target_state`.
             If False, return only the first transition starting from the smallest `state`.
+        only_exits : bool, optional (default=False)
+            If True, consider only the transitions that leave the basin
+            (`transient == False`) -- the ones `refine_absorbing` gives a
+            refined barrier and saddle to. `transient` is written per
+            transition from the event's own barrier, so transitions reaching
+            one state can disagree about it.
 
         Returns
         -------
@@ -142,6 +152,8 @@ class StatesConnectivity:
 
         # Find sub dataframe with state_connexion == target_state
         sub_df = self.df[self.df["state_connexion"] == target_state]
+        if only_exits:
+            sub_df = sub_df[sub_df["transient"] == False]  # noqa: E712
 
         if not return_all:
             # Return the first transition with lower from state

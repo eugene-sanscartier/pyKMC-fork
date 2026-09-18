@@ -114,8 +114,11 @@ class BasinsGenericEvents:
         self.current_state = None  # Current state where we're at
         self.states_to_explore = None  # List of state to explore
         self.explored_states = None  # List of state that we already explored
+        self.next_state_index = 1  # First state index never handed out yet
         self.states: dict[int, StateData] = {}  # Dictionnary of StateDate
-        self.absorbing_saddle_configurations: dict[tuple[int, int], Configuration] = {}
+        # Keyed by connectivity row, not by (state, state_connexion): several
+        # transitions can join the same pair of states, on different atoms.
+        self.absorbing_saddle_configurations: dict[int, Configuration] = {}
 
     def execute(self, system):
         """
@@ -177,8 +180,17 @@ class BasinsGenericEvents:
         t_exit = result.ok_value().t_exit
         exit_state = result.ok_value().exit_state
 
+        # The exit is one row of the connectivity table, and the refined saddle
+        # and barrier belong to that row: several rows can join the same pair of
+        # states on different atoms, so the pair alone does not identify it.
+        # Only the rows that leave the basin were refined, and rows into one
+        # state can disagree about that, so the row is taken from those.
+        exit_row = self.connectivity_table.get_transition_to_state(
+            target_state=exit_state, as_tuples=False, only_exits=True
+        )
+        idx = exit_row.index[0]
         from_state, event_idx, central_atom, sym_idx, is_transient = (
-            self.connectivity_table.get_transition_to_state(target_state=exit_state)
+            self.connectivity_table.to_tuples(exit_row)[0]
         )
         # Ensure from_state is state are full
         self.states[from_state].ensure_full_state(self.params)
@@ -192,7 +204,7 @@ class BasinsGenericEvents:
         neighbors = self.states[from_state].neighbors_list.get_neighbors(
             "rcut", central_atom
         )
-        saddle_configuration = self.absorbing_saddle_configurations[(from_state, exit_state)]
+        saddle_configuration = self.absorbing_saddle_configurations[idx]
         return Ok(
             BasinOutput(
                 initial_system_configuration=self.states[from_state].system.configuration,
@@ -200,10 +212,7 @@ class BasinsGenericEvents:
                 saddle_configuration=saddle_configuration,
                 final_configuration=self.states[exit_state].system.configuration[neighbors],
                 neighbors=neighbors,
-                dE_forward=self.connectivity_table.df[
-                    (self.connectivity_table.df["state"] == from_state)
-                    & (self.connectivity_table.df["state_connexion"] == exit_state)
-                ].iloc[0]["dE_forward"],
+                dE_forward=self.connectivity_table.df.loc[idx, "dE_forward"],
                 k_tot=self.connectivity_table.df.loc[
                     self.connectivity_table.df["transient"] == False, "k_forward"
                 ].sum(),
@@ -229,6 +238,10 @@ class BasinsGenericEvents:
         self.current_state = 0
         self.states_to_explore = [0]
         self.explored_states = []
+        # A state index is never reused: an index that has been merged away is
+        # still in `explored_states`, so handing it out again gives a
+        # transition a target nothing will ever create.
+        self.next_state_index = 1
         self.connectivity_table = BasinStatesConnectivity()
         self.explorer = BasinGenericEventExplorer(
             params=self.params, reference_table=self.reference_table
@@ -264,14 +277,17 @@ class BasinsGenericEvents:
 
             # Explore state
             self.current_state = to_explore
-            last_state_connectivity = self.get_last_state_index()
+            start_index = self.next_state_index
 
             self.explorer.explore(
                 state=self.states[to_explore],
                 state_index=self.current_state,
-                start_index=last_state_connectivity,
+                start_index=start_index,
             )
             n_transitions = len(self.explorer.connectivity_table.get_table())
+            # The explorer numbers its transitions start_index, start_index+1,
+            # ... so this is the first index it left free.
+            self.next_state_index = start_index + n_transitions
 
             # to_explore has been explored :
             self.states_to_explore.remove(to_explore)
@@ -466,15 +482,6 @@ class BasinsGenericEvents:
         convinient method
         """
         pass
-
-    def get_last_state_index(self):
-        if self.current_state == 0:  # connextion table is empty
-            new_state_connexion = 1
-        else:  # last state connexion +1
-            new_state_connexion = int(
-                self.connectivity_table.get_table()["state_connexion"].iloc[-1] + 1
-            )
-        return new_state_connexion
 
     def update_to_explore(self):
         # Find all state index in the connexion table :
@@ -729,15 +736,11 @@ class BasinsGenericEvents:
             # a periodic boundary during the saddle search off by a whole
             # cell vector relative to the rest of the cluster), matching how
             # every other local cluster in the codebase is normalized.
-            idx_state = self.connectivity_table.df.loc[idx].at["state_connexion"]
-            from_state_for_saddle = self.connectivity_table.df.loc[idx].at["state"]
             central_atom_position = self.states[ctx["state"]].system.positions[
                 ctx["central_atom"]
             ]
-            self.absorbing_saddle_configurations[(from_state_for_saddle, idx_state)] = (
-                geometry.unwrap_around(
-                    result_sad.ok_value().saddle[ctx["neighbors"]], central_atom_position
-                )
+            self.absorbing_saddle_configurations[idx] = geometry.unwrap_around(
+                result_sad.ok_value().saddle[ctx["neighbors"]], central_atom_position
             )
             # update connectivity table row
             self.connectivity_table.df.loc[idx, "dE_forward"] = dE
