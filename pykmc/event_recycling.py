@@ -59,7 +59,7 @@ class Recycling(ABC):
 class DistanceRecycling(Recycling):
     """Recycle events whose central atom (a) did not move and (b) is far from the executed event.
 
-    A candidate event survives iff BOTH:
+    Only ARTn-refined rows (`refined == "T"`) are candidates. One survives iff BOTH:
 
       1. its central atom's pre→post displacement (PBC minimum-image) is below
          ``movement_thr``, AND
@@ -101,6 +101,11 @@ class DistanceRecycling(Recycling):
         for i in table.index:
             # Never recycle the just-executed event itself.
             if i == executed_idx:
+                continue
+            # Only an ARTn-refined barrier is this atom's own measurement; a
+            # trusted row carries the catalogue's, which is no measurement to
+            # keep, and is placed again next step at no search cost.
+            if table.loc[i, "refined"] != "T":
                 continue
             atom_idx = int(table.loc[i, "atom_index"])
 

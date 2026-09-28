@@ -2,7 +2,7 @@
 
 from pykmc.enginemanager.lmpi.pool import Manager
 from pykmc import Parameters, Configuration
-from pykmc.result import Result, Ok, Err, ReconstructionOutput, ErrorInfo, ErrorType
+from pykmc.result import Result, Ok, Err, ReconstructionOutput, geometry_error
 import numpy as np
 from pykmc.utils.geometry import push_towards, compute_delr_max, wrap_configuration
 from pykmc import log
@@ -21,7 +21,6 @@ class Reconstruction:
         supposed_min1: Configuration,
         supposed_min2: Configuration,
         saddle: Configuration,
-        delr_thr,
         neighbors=None,
     ):
         """From a saddle point, try to reconstruct the event to see if it matches the
@@ -47,16 +46,14 @@ class Reconstruction:
             The hypothesized second minimum's types/positions/cell.
         saddle : Configuration
             The saddle point's types/positions/cell.
-        delr_thr : _type_
-            _description_
-        neighbors : _type_, optional
-            _description_, by default None
-            typically the neighors list of the in the atomic environment of the atom on which we apply the event
+        neighbors : np.ndarray, optional
+            The atoms of `saddle` the minima are indexed against, typically
+            the central atom's neighbours; every atom when not given.
         """
         jobs = {0: (supposed_min1, supposed_min2, saddle, neighbors)}
-        return self.reconstruct_many(jobs, delr_thr)[0]
+        return self.reconstruct_many(jobs)[0]
 
-    def reconstruct_many(self, jobs, delr_thr) -> dict:
+    def reconstruct_many(self, jobs) -> dict:
         """Reconstruct several events at once, one `Result` per key of `jobs`.
 
         Every min1 is submitted before any is read, then every min2 of the
@@ -69,9 +66,10 @@ class Reconstruction:
         jobs : dict
             key -> `(supposed_min1, supposed_min2, saddle, neighbors)`, each
             entry as :meth:`reconstruct` takes them.
-        delr_thr : float
-            Maximum per-atom deviation from a supposed minimum.
+
+        Each minimum is judged against its prediction at `psr.accept_thr`.
         """
+        accept_thr = self.params.psr.accept_thr
         jobs = {
             key: (min1, min2, saddle, np.arange(len(saddle)) if neighbors is None else neighbors)
             for key, (min1, min2, saddle, neighbors) in jobs.items()
@@ -91,14 +89,8 @@ class Reconstruction:
             min1_configuration, _ = futures[key].result()
 
             delr1 = compute_delr_max(min1, wrap_configuration(min1_configuration)[neighbors])
-            if delr1 > delr_thr:
-                results[key] = Err(
-                    ErrorInfo(
-                        type=ErrorType.RECONSTRUCTION_INVALID_MIN1,
-                        message="did not retreive initial minimum : delr1 = {}".format(delr1),
-                        variables={"delr1": delr1},
-                    )
-                )
+            if delr1 > accept_thr:
+                results[key] = Err(geometry_error("min1", delr1, accept_thr))
             else:
                 min1_configurations[key] = min1_configuration
 
@@ -117,14 +109,8 @@ class Reconstruction:
             _, min2, saddle, neighbors = jobs[key]
 
             delr2 = compute_delr_max(min2, wrap_configuration(min2_configuration)[neighbors])
-            if delr2 > delr_thr:
-                results[key] = Err(
-                    ErrorInfo(
-                        type=ErrorType.RECONSTRUCTION_INVALID_MIN2,
-                        message=f"did not retreive expected final minimum : delr2 = {delr2}",
-                        variables={"delr2": delr2},
-                    )
-                )
+            if delr2 > accept_thr:
+                results[key] = Err(geometry_error("min2", delr2, accept_thr))
             else:
                 results[key] = Ok(
                     ReconstructionOutput(

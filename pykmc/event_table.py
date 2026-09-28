@@ -792,6 +792,7 @@ class ActiveEventTable:
                 "dE_forward": pd.Series(dtype="float64"),
                 "k": pd.Series(dtype="float64"),
                 "num_reference_event": pd.Series(dtype="int64"),
+                "symmetry_index": pd.Series(dtype="object"),
                 "refined": pd.Series(dtype="str"),
                 "neighbors": pd.Series(dtype="object"),
             }
@@ -947,6 +948,7 @@ class ActiveEventTable:
                     event_refinement_output.dE_forward, self.params
                 ),
                 "num_reference_event": event_refinement_output.num_reference_event,
+                "symmetry_index": event_refinement_output.symmetry_index,
                 "refined": event_refinement_output.refined,
                 "neighbors": event_refinement_output.neighbors,
             }

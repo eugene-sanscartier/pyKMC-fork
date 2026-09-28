@@ -285,13 +285,9 @@ class KMC:
                 atom_shapes=atom_shapes,
             )
 
-            # == ADD ACTIVE EVENT TO ACTIVE EVENT TABLE ==
-            # The persistent self.active_table is extended in place; recycled
+            # The persistent self.active_table was extended in place; recycled
             # rows from the previous step are already present.
-            self.add_active_events(refinement.get_successes_results())
             active_table = self.active_table
-
-            active_table.remove_duplicates(self.neighbors_list)  # To be sure
             log.info(f"{len(active_table.table)} active events after removing duplicates.", depth=1)
 
             # == Update System ==
@@ -358,9 +354,7 @@ class KMC:
                     )
                 log.info("Exploring the Basin.", depth=1)
                 # get basin info/explore
-                basin = BasinsGenericEvents(
-                    self.params, self.reference_table, self.manager
-                )
+                basin = BasinsGenericEvents(self.params, self.reference_table, self.manager, step)
                 self.system.update_positions(
                     result_reconstruction.ok_value().min1_configuration
                 )
@@ -422,7 +416,8 @@ class KMC:
                             self.system.types,
                             self.reference_table,
                             basin.connectivity_table,
-                            result_basin.ok_value().exit_state,
+                            result_basin.ok_value().exit_row,
+                            basin.absorbing_saddle_configurations,
                         )
                         self.loggers.events_basin_info_line("events", idx_exit_event)
                         self.loggers.events_write("events", basin_info)
@@ -438,10 +433,7 @@ class KMC:
                         f"Basin fails with error : {fmt_error(result_basin.err_value())}, back to original event",
                         depth=1,
                     )
-                if basin.connectivity_table is not None:
-                    basin.connectivity_table.save(
-                        "basin_connectivity_" + str(step) + ".pickle"
-                    )
+                basin.save()
                 # Basin super-event spans many atoms; recycling is deferred (the
                 # prune below runs with the recycler detached).
                 prune_detach_recycler = True
@@ -1002,14 +994,25 @@ class KMC:
         candidates = self.build_refinement_candidates(
             atom_shapes, existing_pairs=existing_pairs
         )
-        refinement = Refinement(
-            self.params,
-            self.system,
-            self.neighbors_list,
-            self.manager,
-        )
+        return self.refine_candidates(candidates)
+
+    def refine_candidates(self, candidates: list[RefinementCandidate]) -> Refinement:
+        """Refine `candidates` and add each one that came back on its prediction to the active table.
+
+        Every candidate reaches the active table through here -- the step's own,
+        and one being refined again after its reconstruction missed -- so each
+        is retried and reported on the same terms however it arrived.
+        """
+        refinement = Refinement(self.params, self.system, self.neighbors_list, self.manager)
         refinement.execute(candidates)
+
         self.otfml.retry_extrapolating("refine", refinement)
+        for _ in range(self.params.control.refine_retry):
+            refinement.retry_failed()
+        refinement.report()
+
+        self.add_active_events(refinement.get_successes_results())
+        self.active_table.remove_duplicates(self.neighbors_list)
         return refinement
 
     def add_active_events(
@@ -1080,6 +1083,9 @@ class KMC:
 
         err_reference = []
         err_ae = []
+        # How many times each candidate has been refined again after its
+        # reconstruction missed, keyed by what identifies it across its rows.
+        attempts = {}
         while len(active_table.table) > 0:
             ##=>Select event
             idx_selected_event, delta_t, ktot = self._select_event(active_table)
@@ -1126,8 +1132,29 @@ class KMC:
                 err_reference += [num_ref_event]
                 err_ae += [ae_topo]
 
-                log.info("Removing active event.", depth=1)
+                central_atom = int(selected_event.at["atom_index"])
+                symmetry_index = selected_event.at["symmetry_index"]
                 active_table.remove(idx_selected_event)
+                candidate = (central_atom, int(num_ref_event), symmetry_index)
+                attempts[candidate] = attempts.get(candidate, 0) + 1
+                budget = self.params.control.refine_retry
+                if pd.notna(symmetry_index) and attempts[candidate] <= budget:
+                    log.info(f"Refining it again (attempt {attempts[candidate]} of {budget}).", depth=1)
+                    dfevent = self.reference_table.table[
+                        self.reference_table.table["idx_ref"] == num_ref_event
+                    ].iloc[0]
+                    self.manager.use_local()
+                    self.refine_candidates([
+                        RefinementCandidate(
+                            central_atom_index=central_atom,
+                            dfevent=dfevent,
+                            symmetry_index=int(symmetry_index),
+                            verify=True,
+                        )
+                    ])
+                    self.manager.use_global()
+                else:
+                    log.info("Removing active event.", depth=1)
         else:
             log.error("All event reconstuctions failed.")
             self._close()
@@ -1163,7 +1190,6 @@ class KMC:
             supposed_initial,
             supposed_final,
             self.system.configuration,
-            self.params.psr.matching_score_thr,
             neighbors,
         )
         # result with min1, saddle, min2 pos

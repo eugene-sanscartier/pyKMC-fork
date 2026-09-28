@@ -49,8 +49,10 @@ _ARTN_SHORT_MESSAGES = {
 }
 
 
-def _artn_error_details(errno: int, message: str) -> str:
-    """Render an ARTn (errno, message) pair, tagging a recognized message with its short label."""
+def _artn_error_details(errno: int, message: str) -> str | None:
+    """Render an ARTn (errno, message) pair, tagging a recognized message with its short label. `None` when it reports nothing."""
+    if errno == 0 and not message:
+        return None
     for prefix, label in _ARTN_SHORT_MESSAGES.items():
         if message.startswith(prefix):
             return f"errno={errno}: [{label}]"
@@ -596,119 +598,71 @@ def partn_refine(
 
         artn.set("forc_thr", params.partn.r_forc_thr)
 
-        max_attempts = params.partn.r_max_attempts
-        inner_attempt = 0
-        attempts_detail = []
         atoms_frozen = _make_frozen_group(engine, params, configuration)
         _apply_frozen_fix(engine, "f_frozen_pre", atoms_frozen)
 
-        while inner_attempt < max_attempts:
-            exit_flag = False
-            result = None
-            engine.command("fix 10 all artn dmax {}".format(params.partn.r_dmax))
-            _apply_frozen_fix(engine, "f_frozen_post", atoms_frozen)
-            engine.command("min_style fire")
-            engine.command(f"minimize 1e-6 1e-8 10000 {params.partn.r_nevalf_max}")
-            engine.command("unfix 10")
-            _remove_frozen_fix(engine, "f_frozen_post", atoms_frozen)
+        result = None
+        engine.command("fix 10 all artn dmax {}".format(params.partn.r_dmax))
+        _apply_frozen_fix(engine, "f_frozen_post", atoms_frozen)
+        engine.command("min_style fire")
+        engine.command(f"minimize 1e-6 1e-8 10000 {params.partn.r_nevalf_max}")
+        engine.command("unfix 10")
+        _remove_frozen_fix(engine, "f_frozen_post", atoms_frozen)
 
-            if engine.rank == 0:
-                if params.control.otfml:
-                    extrapolation_error = _build_extrapolation_error(
-                        get_otf_flags(engine),
-                        phase="refine",
-                        message="Refinement extrapolated and must be retried.",
-                        variables={
-                            "central_atom_index": central_atom_idx,
-                            "num_reference_event": num_reference_event,
-                            "symmetry_index": symmetry_index,
-                        },
-                    )
-                    if extrapolation_error is not None:
-                        exit_flag = True
-                        result = extrapolation_error
-                if not exit_flag:
-                    err = artn.get_error()
-                    has_extract = artn.extract("has_sad")
-
-                    if err[0] == 0 and has_extract:
-                        delr_sad = artn.extract("delr_sad")
-                        if delr_sad < params.partn.r_delr_sad_thr:
-                            E_sad = artn.extract("etot_sad")
-                            E_result = E_sad - E_init
-                            saddlepositions = artn.extract("tau_sad")
-
-                            if params.control.active_volume == True:
-                                saddlepositions_results = positions.copy()
-                                for i, atom_idx in enumerate(atom_map):
-                                    saddlepositions_results[atom_idx][0] = (
-                                        saddlepositions[i][0]
-                                    )
-                                    saddlepositions_results[atom_idx][1] = (
-                                        saddlepositions[i][1]
-                                    )
-                                    saddlepositions_results[atom_idx][2] = (
-                                        saddlepositions[i][2]
-                                    )
-                            else:
-                                saddlepositions_results = saddlepositions
-
-                            exit_flag = True
-                            result = Ok(
-                                EventRefinementOutput(
-                                    central_atom_index=central_atom_idx,
-                                    saddle=Configuration(
-                                        types=types,
-                                        positions=saddlepositions_results,
-                                        cell=cell,
-                                    ),
-                                    E_saddle=E_result,
-                                    num_reference_event=num_reference_event,
-                                    symmetry_index=symmetry_index,
-                                    refined="T",
-                                )
-                            )
-                        else:
-                            attempts_detail.append(
-                                {
-                                    "attempt": inner_attempt,
-                                    "err": err,
-                                    "has_sad": True,
-                                    "delr_sad": delr_sad,
-                                }
-                            )
-                    else:
-                        attempts_detail.append(
-                            {
-                                "attempt": inner_attempt,
-                                "err": err,
-                                "has_sad": bool(has_extract),
-                                "delr_sad": None,
-                            }
-                        )
-            exit_flag = engine.local_engine_comm.bcast(exit_flag, root=0)
-            if exit_flag:
-                _remove_frozen_fix(engine, "f_frozen_pre", atoms_frozen)
-                _delete_frozen_group(engine, atoms_frozen)
-                return result
-
-            inner_attempt += 1
-            artn.set("zseed", params.partn.zseed)
-
-        else:
-            _remove_frozen_fix(engine, "f_frozen_pre", atoms_frozen)
-            _delete_frozen_group(engine, atoms_frozen)
-            if engine.rank == 0:
-                err = artn.get_error()
-                return Err(
-                    ErrorInfo(
-                        type=ErrorType.EVENT_NOT_FOUND,
-                        message="",
-                        details=_artn_error_details(*err),
-                        variables={"attempts_detail": attempts_detail},
-                    )
+        # The engine answers only whether ARTn converged on a saddle; whether
+        # it is the saddle asked for is judged against the placement by
+        # `Refinement`, which re-runs the search on a fresh seed if not.
+        if engine.rank == 0:
+            if params.control.otfml:
+                result = _build_extrapolation_error(
+                    get_otf_flags(engine),
+                    phase="refine",
+                    message="Refinement extrapolated and must be retried.",
+                    variables={
+                        "central_atom_index": central_atom_idx,
+                        "num_reference_event": num_reference_event,
+                        "symmetry_index": symmetry_index,
+                    },
                 )
-            return None
+            if result is None:
+                err = artn.get_error()
+                has_extract = artn.extract("has_sad")
+
+                if err[0] == 0 and has_extract:
+                    barrier = artn.extract("etot_sad") - E_init
+                    tau_sad = artn.extract("tau_sad")
+
+                    if params.control.active_volume == True:
+                        # ARTn saw only the active volume, one row per atom of
+                        # it, so its saddle goes back where those atoms came
+                        # from and the rest of the cell stays as it was.
+                        saddle = positions.copy()
+                        saddle[atom_map] = tau_sad
+                    else:
+                        saddle = tau_sad
+
+                    result = Ok(
+                        EventRefinementOutput(
+                            central_atom_index=central_atom_idx,
+                            saddle=Configuration(types=types, positions=saddle, cell=cell),
+                            E_saddle=barrier,
+                            num_reference_event=num_reference_event,
+                            symmetry_index=symmetry_index,
+                            refined="T",
+                        )
+                    )
+                else:
+                    result = Err(
+                        ErrorInfo(
+                            type=ErrorType.EVENT_NOT_FOUND,
+                            message="",
+                            details=_artn_error_details(*err) or "no saddle",
+                        )
+                    )
+
+        _remove_frozen_fix(engine, "f_frozen_pre", atoms_frozen)
+        _delete_frozen_group(engine, atoms_frozen)
+        return result
     except RuntimeError as exc:
         recovery_error = None
         try:

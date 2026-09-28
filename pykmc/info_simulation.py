@@ -223,14 +223,9 @@ def info_refinements(
             "ref_event": [],
             "matching_score": [],
         },
-        "invalid_dE": {"n": 0, "ref_event": []},
+        "invalid_geometry": {"n": 0, "ref_event": [], "delr": [], "attempts": 0},
         "invalid_minima": {"n": 0, "ref_event": []},
-        "event_not_found": {
-            "n": 0,
-            "ref_event": [],
-            "no_saddle_found": 0,
-            "delr_sad_too_large": 0,
-        },
+        "event_not_found": {"n": 0, "ref_event": [], "attempts": 0},
         "runtime_error": {"n": 0, "ref_event": []},
     }
     for res in results_refinements:
@@ -251,11 +246,13 @@ def info_refinements(
                     n_fails["matching_score_>_matching_threshold"][
                         "matching_score"
                     ].append(res.err_value().variables["matching_score"])
-                case ErrorType.REFINEMENT_INVALID_ENERGY_BARRIER:
-                    n_fails["invalid_dE"]["n"] += 1
-                    n_fails["invalid_dE"]["ref_event"].append(
+                case ErrorType.INVALID_GEOMETRY:
+                    n_fails["invalid_geometry"]["n"] += 1
+                    n_fails["invalid_geometry"]["ref_event"].append(
                         res.err_value().variables["n_ref_event"]
                     )
+                    n_fails["invalid_geometry"]["delr"].append(res.err_value().variables["delr"])
+                    n_fails["invalid_geometry"]["attempts"] += res.err_value().variables["attempts"]
                 case ErrorType.REFINEMENT_INVALID_MINIMA:
                     n_fails["invalid_minima"]["n"] += 1
                 case ErrorType.EVENT_NOT_FOUND:
@@ -263,11 +260,7 @@ def info_refinements(
                     n_fails["event_not_found"]["ref_event"].append(
                         res.err_value().variables["n_ref_event"]
                     )
-                    for attempt in res.err_value().variables["attempts_detail"]:
-                        if attempt["has_sad"]:
-                            n_fails["event_not_found"]["delr_sad_too_large"] += 1
-                        else:
-                            n_fails["event_not_found"]["no_saddle_found"] += 1
+                    n_fails["event_not_found"]["attempts"] += res.err_value().variables["attempts"]
                 case ErrorType.EVENT_REFINEMENT_RUNTIME_ERROR:
                     n_fails["runtime_error"]["n"] += 1
                     n_fails["runtime_error"]["ref_event"].append(
@@ -357,15 +350,16 @@ def info_active_events(
 
 
 def info_basin_events(
-    system_types, reference_table, connectivity_table, exit_state
+    system_types, reference_table, connectivity_table, exit_row, refined_rows
 ) -> tuple[int, EventsInfo]:
     """Construct dataclass with exit basin events"""
 
-    # Only exit state
-    data = connectivity_table.df[
-        connectivity_table.df["transient"] == False
-    ].reset_index(drop=True)
-    idx_selected_event = data.index[data["state_connexion"] == exit_state][0]
+    # Only the transitions that leave the basin; the selected one is found by
+    # its row, since several can reach the same state.
+    exits = connectivity_table.exits()
+    refined = ["T" if idx in refined_rows else "F" for idx in exits.index]
+    idx_selected_event = list(exits.index).index(exit_row)
+    data = exits.reset_index(drop=True)
 
     # Connectivity table data
     central_atom = data["central_atom"].to_numpy(dtype=int, copy=True)
@@ -373,7 +367,6 @@ def info_basin_events(
     reference_events = data["event_connexion"].to_numpy(copy=True)
     dE_forward = data["dE_forward"].to_numpy(copy=True)
     k = data["k_forward"].to_numpy(copy=True)
-    refined = len(central_atom) * ["T"]
 
     # Needed mapping to extract reference table info
     idx_ref = reference_table.table["idx_ref"].values

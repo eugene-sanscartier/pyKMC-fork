@@ -100,6 +100,12 @@ class ControlParameters(BaseModel):
         description="Event constributing to this percent of ktot are refined.",
     )
 
+    refine_retry: int = Field(
+        default=5,
+        ge=0,
+        description="How many times a candidate's saddle search is run again, on a fresh seed, when it does not return the transition asked for -- ARTn finding no saddle, or finding one off the geometry the candidate was placed on, or the reconstruction pushed from it missing a minimum. Its transition is dropped once the budget is spent; 0 drops it on the first failure.",
+    )
+
     basin: Optional[bool] = Field(default=False, description="Basin mode")
 
     active_volume: Optional[bool] = Field(
@@ -483,18 +489,6 @@ class PartnParameters(BaseModel):
         description="Stop an artn refinement before end when the number of force evaluations by the force engine is greater to nevalf_max.",
     )
 
-    # Max single refinement attempt
-    r_max_attempts: int = Field(
-        default=5,
-        description="When adjusting the saddle energy and positions, in some rare cases partn has trouble finding the saddle point and goes back to the minium."
-        "In that case, we do another attempt with a different seed.",
-    )
-
-    r_delr_sad_thr: float = Field(
-        default=0.4,
-        description="When a saddle point is found by pARTn, we compare artn delr_sad to this threshold to check if the system went back to the minimum. If yes, new attempt.",
-    )
-
     # Initial_push
     r_push_mode: Literal["list", "rad"] = Field(
         default="list",
@@ -648,8 +642,18 @@ class PSRParameters(BaseModel):
 
     matching_score_thr: float = Field(
         default=0.1,
-        description="Maximum value of the matching score of the algorithm used.",
+        description="Maximum value of the matching score of the algorithm used. Decides identity: which geometries are the same shape, symmetry variant or move.",
     )
+
+    accept_factor: float = Field(
+        default=1.50,
+        description="How much wider than `matching_score_thr` a geometry may deviate from a prediction before it is rejected.",
+    )
+
+    @property
+    def accept_thr(self) -> float:
+        """`matching_score_thr` widened by `accept_factor`, for a geometry judged against a prediction."""
+        return self.accept_factor * self.matching_score_thr
 
 
 class ActiveVolume(BaseModel):
@@ -809,6 +813,11 @@ class BasinParameters(BaseModel):
     )
 
     energy_thr: float = Field(default=0.0, description="Energy threshold")
+
+    checkpoint: bool = Field(
+        default=False,
+        description="Rewrite the step's basin_connectivity_<step>.pickle and basin_states_<step>.pickle after each basin state-creation wave, so a run stopped mid-basin leaves what was explored so far.",
+    )
 
 
 class EventRecyclingParameters(BaseModel):

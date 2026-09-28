@@ -116,12 +116,38 @@ class ErrorType(Enum):
     EXTREME_EXTRAPOLATION = 17
     PSR_NO_MATCH_FOUND = 21
     PSR_MATCHING_SCORE_ABOVE_ACCEPTANCE_THRESHOLD = 22
-    REFINEMENT_INVALID_ENERGY_BARRIER = 31
     REFINEMENT_INVALID_MINIMA = 32
-    RECONSTRUCTION_INVALID_MIN1 = 41
-    RECONSTRUCTION_INVALID_MIN2 = 42
+    # An achieved geometry did not reproduce the one predicted for it. Carries
+    # `stage` -- "saddle", "min1" or "min2" -- with the measured `delr` and the
+    # `thr` it missed.
+    INVALID_GEOMETRY = 41
     BASIN_TEXIT_NOT_FOUND = 51
     BASIN_UNKNOWN_INITIAL_ENVIRONMENT = 52
+
+
+GEOMETRY_STAGES = ("saddle", "min1", "min2")
+
+
+def geometry_error(stage: str, delr: float, thr: float, **context) -> ErrorInfo:
+    """A transition's `stage` came back too far from the geometry predicted for it.
+
+    Parameters
+    ----------
+    stage : str
+        Which of `GEOMETRY_STAGES` was judged.
+    delr : float
+        Largest per-atom deviation from the prediction, in Angstrom.
+    thr : float
+        The tolerance it exceeded.
+    **context
+        Anything further worth recording, such as the `num_reference_event`.
+
+    """
+    return ErrorInfo(
+        type=ErrorType.INVALID_GEOMETRY,
+        message="",
+        variables={"stage": stage, "delr": delr, "thr": thr, **context},
+    )
 
 
 # Dataclass to store operation outputs
@@ -216,6 +242,9 @@ class EventRefinementOutput:
         Symmetry branch used to generate this refinement.
     refined: Optional[str]
         If the event has been refined (T: True, F: False, B: In basin)
+    delr : Optional[float]
+        How far the refined saddle sits from the one that was placed, over the
+        placed cluster's atoms. `None` for a barrier no engine call produced.
     neighbors : Optional[np.ndarray]
         Atom indices `saddle.positions` and `min2.positions` are indexed against.
     """
@@ -228,6 +257,7 @@ class EventRefinementOutput:
     num_reference_event: Optional[int] = None
     symmetry_index: Optional[int] = None
     refined: Optional[str] = None
+    delr: Optional[float] = None
     neighbors: Optional[np.ndarray] = None
 
 
@@ -309,7 +339,7 @@ class BasinSelectorOutput:
     """ "Store the result of the selector"""
 
     t_exit: float
-    exit_state: int
+    exit_row: int
 
 
 @dataclass
@@ -332,6 +362,7 @@ class BasinOutput:
     k_tot: float
     t_exit: float
     exit_state: int
+    exit_row: int
     from_state: int
     num_reference_event: int
 

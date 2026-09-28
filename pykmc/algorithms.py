@@ -5,6 +5,39 @@ import numpy as np
 import math as m
 
 
+def rank_by_coverage(items: list, rates: list[float] | np.ndarray, coverage: float) -> tuple[list, int]:
+    """Rank `items` by descending rate, and size the leading group reaching `coverage` of the total.
+
+    Parameters
+    ----------
+    items : list
+        What is being ranked, one per entry of `rates`.
+    rates : list of float or np.ndarray of float
+        Each item's rate constant, in any order.
+    coverage : float
+        Fraction of the total rate the leading group must reach. At 1 or
+        above the group is every rate, including those too small to move a
+        float64 running sum.
+
+    Returns
+    -------
+    tuple[list, int]
+        - ranked_items : `items` by descending rate.
+        - n : how many of them the leading group holds; at least one unless
+          `items` is empty.
+
+    """
+    k = np.asarray(rates, dtype=float)
+    order = np.argsort(-k, kind="stable")
+    ranked_items = [items[i] for i in order]
+    if len(k) == 0 or coverage >= 1.0:
+        return ranked_items, len(k)
+
+    k_cumulative = np.cumsum(k[order])
+    n = int(np.searchsorted(k_cumulative, coverage * k_cumulative[-1], side="left")) + 1
+    return ranked_items, n
+
+
 def rejection_free(l_k: list[float] | np.ndarray) -> tuple[int, float]:
     """Select an event index and calculates time step using the rejection-free KMC algorithm.
 

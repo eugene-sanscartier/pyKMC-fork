@@ -78,13 +78,24 @@ def fmt_time(value: float) -> str:
     return f"{value:.6e} s"
 
 
+# How an error's context values render, by the name they are filed under.
+# Anything unlisted falls to `fmt_number`.
+ERROR_VALUE_FORMATS = {
+    "delr": fmt_distance,
+    "thr": fmt_distance,
+    "matching_score": fmt_distance,
+}
+
+
 def fmt_error(error: ErrorInfo) -> str:
     """Render an ErrorInfo as its message, type tag, details and variables."""
     text = f"{error.message} [{error.type.name}]" if error.message else f"[{error.type.name}]"
     if error.details:
         text += f" -- {error.details}"
     if error.variables:
-        pairs = ", ".join(f"{k}={fmt_number(v)}" for k, v in error.variables.items())
+        pairs = ", ".join(
+            f"{k}={ERROR_VALUE_FORMATS.get(k, fmt_number)(v)}" for k, v in error.variables.items()
+        )
         text += f" ({pairs})"
     return text
 

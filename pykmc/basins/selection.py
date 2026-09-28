@@ -16,21 +16,21 @@ from pykmc.result import (
 
 class FPTASelector:
     """
-    Selector implementing First Passage Time Analysis (FPTA) to determine the exit time and absorbing state of a basin.
+    Selector implementing First Passage Time Analysis (FPTA) to determine the exit time and exit transition of a basin.
 
     This class follows the procedure described in Ref. [1, 2]:
 
-        1. Build the full generator matrix.
-        2. Construct a reduced generator matrix where all absorbing states are collapsed into a single effective absorbing state.
-        3. Use a numerical solver to compute the exit time from the reduced system.
-        4. Given the exit time, compute the probability distribution over the original absorbing states and select the exit state.
+        1. Build the generator matrix over the transient states, with every absorbing state collapsed into one.
+        2. Use a numerical solver to compute the exit time from it.
+        3. Given the exit time, compute the absorbed population each transition leaving the basin carries, and select the exit transition.
 
     Attributes
     ----------
-    M_abs : np.ndarray or None
-        Full absorbing generator matrix (transient + absorbing states).
-    M_abs_reduced : np.ndarray or None
-        Reduced matrix where all absorbing states are merged into a single one.
+    M : np.ndarray or None
+        Generator over the transient states plus one absorbing row, which
+        collects every transition leaving the basin.
+    order : dict[int, int] or None
+        Transient state to matrix row.
 
     References
     ----------
@@ -40,58 +40,70 @@ class FPTASelector:
 
     def __init__(self) -> None:
 
-        self.M_abs = None  # Absorbing Markov chain generator matrix
-        self.M_abs_reduced = None  # Reduced absorbing markoc chain generator matrix
+        self.M = None  # Reduced absorbing Markov chain generator matrix
+        self.order = None  # Transient state to matrix row
 
     def select_from_connectivity(
-        self, connectivity_table: StatesConnectivity
+        self, connectivity_table: StatesConnectivity, entry: int = 0
     ) -> Result[BasinSelectorOutput, ErrorInfo]:
         """
-        Find both an exit time and an exit absorbing state from a `StatesConnectivity` object.
+        Find both an exit time and the transition the basin is left by, from a `StatesConnectivity` object.
 
         Parameters
         ----------
         connectivity_table : StatesConnectivity
             StatesConnectivity object.
+        entry : int
+            The state the basin was entered from; the chain starts there.
 
         Returns
         -------
         Result[BasinSelectorOutput, ErrorInfo]
-            - Ok(BasinSelectorOutput(t_exit, exit_state) ) on success.
+            - Ok(BasinSelectorOutput(t_exit, exit_row)) on success.
             - Err(ErrorInfo) if exit time solver failed.
         """
-
-        # Number of transient states
-        n_transient_states = len(set(connectivity_table.df["state"]))
-
-        # Build generator matrix
-        self.build_absorbing_matrix_from_connectivity(connectivity_table)
-        # Build reduced matrix (all absorbing states as one)
-        self.build_reduced_matrix(n_transient_states)
+        self.build_matrix(connectivity_table)
 
         # Find exit time :
-        result = self.get_exit_time()
+        result = self.get_exit_time(self.order[entry])
         if not result.is_ok():  # Solver Err when determining t_exit
             return result
         t_exit = result.ok_value().t_exit
 
-        # Find exit state
-        exit_state = self.select_absorbing_state(t_exit=t_exit)
+        # Find exit transition
+        exit_row = self.select_exit_row(connectivity_table, t_exit, self.order[entry])
 
-        return Ok(BasinSelectorOutput(t_exit=t_exit, exit_state=exit_state))
+        return Ok(BasinSelectorOutput(t_exit=t_exit, exit_row=exit_row))
 
-    def build_absorbing_matrix_from_connectivity(
-        self, connectivity_table: StatesConnectivity
-    ) -> None:
+    def exit_shares(self, connectivity_table: StatesConnectivity, entry: int = 0) -> np.ndarray:
+        """Each exit's probability of being the one the basin is left by, in `connectivity_table.exits()` order.
+
+        The share of an exit is its rate times the expected time the chain
+        spends in the state it leaves before absorbing, k_e * tau_u.
         """
-        Construct the full generator matrix M_abs from a `StatesConnectivity` object.
+        self.build_matrix(connectivity_table)
+        n_transient_states = len(self.order)
+
+        p0 = np.zeros(n_transient_states)
+        p0[self.order[entry]] = 1
+        tau = np.linalg.solve(self.M[:n_transient_states, :n_transient_states], p0)
+
+        exits = connectivity_table.exits()
+        shares = exits["k_forward"].to_numpy(dtype=float) * tau[exits["state"].map(self.order).to_numpy()]
+        return shares
+
+    def build_matrix(self, connectivity_table: StatesConnectivity) -> None:
+        """
+        Construct the generator matrix M, every absorbing state collapsed into its last row.
 
         The matrix is defined as:
             - M_ij = -k_ji for i ≠ j
             - M_ii = -sum_{j≠i} M_ij
         where k are the rates.
 
-        We force the absorbing -> transient rate to be equal to 0.
+        A state is transient when something was explored out of it, so it
+        appears in the `state` column; the absorbing row has no outgoing
+        rate, so its column is 0.
 
         Parameters
         ----------
@@ -103,66 +115,29 @@ class FPTASelector:
 
         None
         """
-
-        # Build empty Absorbin markoc chain transition matrix
-        n_states = (
-            max(
-                set(connectivity_table.df["state"])
-                | set(connectivity_table.df["state_connexion"])
-            )
-            + 1
-        )
-        self.M_abs = np.zeros((n_states, n_states))
+        df = connectivity_table.df
+        self.order = {state: row for row, state in enumerate(sorted(set(df["state"])))}
+        n_transient_states = len(self.order)
+        self.M = np.zeros((n_transient_states + 1, n_transient_states + 1))
 
         # Non diagonal elements : M_ij = -k_ji
-        for _, row in connectivity_table.df.iterrows():
-            # for each row we find
-            i = row["state"]
-            j = row["state_connexion"]
-
-            self.M_abs[j, i] -= row["k_forward"]
-        # Absorbing columns will always be O since we initialize M as a Null matrix and absorbing state are never in ['state']
+        columns = df["state"].map(self.order).to_numpy()
+        rows = df["state_connexion"].map(self.order).fillna(n_transient_states).to_numpy(dtype=int)
+        np.subtract.at(self.M, (rows, columns), df["k_forward"].to_numpy(dtype=float))
 
         # Diagonal elements : M_ii = sum_j k_ij
-        for i in range(
-            len(set(connectivity_table.df["state"]))
-        ):  # only diag for transient states
-            # since M_ij has kj->i elements:
-            self.M_abs[i, i] = -sum(
-                [self.M_abs[j, i] for j in range(n_states) if j != i]
-            )
+        for i in range(n_transient_states):
+            self.M[i, i] = 0.0
+            self.M[i, i] = -self.M[:, i].sum()
 
-    def build_reduced_matrix(self, n_transient_states: int) -> None:
+    def get_exit_time(self, entry_row: int = 0) -> Result[BasinExitTimeSolverOutput, ErrorInfo]:
         """
-        Build the reduced generator matrix where all absorbing states are collapsed into a single absorbing state.
+        Use Solver to find the exit time form the reduced matrix.
 
         Parameters
         ----------
-        n_transient_states : int
-            Number of transient states.
-
-        Returns
-        -------
-        None
-
-        Notes
-        -----
-        Reducing the absorbing block reduces the matrix size and accelerates computation of exp(-M_abs * t).
-        """
-
-        self.M_abs_reduced = np.zeros((n_transient_states + 1, n_transient_states + 1))
-        # Copy the transient part
-        self.M_abs_reduced[:n_transient_states, :n_transient_states] = self.M_abs[
-            :n_transient_states, :n_transient_states
-        ]
-
-        ## Sum the rates of absorbing states only line is affected, last row should be = 0
-        for i in range(n_transient_states):
-            self.M_abs_reduced[-1, i] = self.M_abs[n_transient_states:, i].sum()
-
-    def get_exit_time(self) -> Result[BasinExitTimeSolverOutput, ErrorInfo]:
-        """
-        Use Solver to find the exit time form the reduced matrix.
+        entry_row : int
+            Matrix row of the state the basin was entered from.
 
         Returns
         -------
@@ -172,50 +147,64 @@ class FPTASelector:
         """
 
         # Initialize
-        p0 = np.zeros(len(self.M_abs_reduced))
-        p0[0] = 1  # we are always in state 0 when entering the basin
+        p0 = np.zeros(len(self.M))
+        p0[entry_row] = 1  # the chain starts where the basin was entered
 
         # Pick random number between [0,1) representing the probability of being in an absorbing states after time t
         r1 = np.random.random()
 
         # Use solver :
-        exit_time_solver = BisectionSolver(self.M_abs_reduced, p0, r1)
+        exit_time_solver = BisectionSolver(self.M, p0, r1)
         result = exit_time_solver.solve()
 
         return result
 
-    def select_absorbing_state(self, t_exit: float) -> int:
+    def select_exit_row(
+        self, connectivity_table: StatesConnectivity, t_exit: float, entry_row: int = 0
+    ) -> int:
         """
-        Find which absorbing state is reached at the given exit time.
+        Find which transition the basin is left by at the given exit time.
+
+        A transition's share of the absorbed population is its rate times how
+        long the chain sits in the state it leaves, k_e * tau_u. Summed over the
+        transitions reaching one absorbing state that is exactly that state's
+        population at `t_exit`, so drawing a transition also draws the state it
+        reaches, with the distribution the absorbing populations give.
 
         Parameters
         ----------
+        connectivity_table : StatesConnectivity
+            StatesConnectivity object.
         t_exit : float
             Exit time.
+        entry_row : int
+            Matrix row of the state the basin was entered from.
 
         Returns
         -------
         int
-            Index of the absorbing state selected (matching the original
-            numbering of the full matrix M_abs).
+            The connectivity row of the transition selected.
         """
+        n_transient_states = len(self.order)
+        p0 = np.zeros(len(self.M))
+        p0[entry_row] = 1  # the chain starts where the basin was entered
 
-        # Compute full probability vector
-        # initial vector
-        p0 = np.zeros(len(self.M_abs))
-        p0[0] = 1  # always at state 0 when entering the basin
+        # p(t) = exp(-M t) p0
+        p = np.real(solve_master_equation(self.M, t_exit, p0))
 
-        # compute P = ext(-Mt)p0
-        p = solve_master_equation(self.M_abs, t_exit, p0)
+        # dp/dt = -M p integrates to M tau = p(0) - p(t) over the transient
+        # block, so one solve gives every transient state's time-integrated
+        # occupancy. A residence time cannot be negative; the solve can still
+        # return a small negative where a population has all but drained.
+        transient = slice(None, n_transient_states)
+        tau = np.linalg.solve(self.M[transient, transient], p0[transient] - p[transient])
+        tau = np.clip(tau, 0.0, None)
 
-        # Select only absorbing state
-        p_absorbing = p[len(self.M_abs_reduced) - 1 :]
-        # asjust so sum gives 1
-        p_absorbing = p_absorbing / np.sum(p_absorbing)
+        exits = connectivity_table.exits()
+        flux = np.cumsum(exits["k_forward"].to_numpy(dtype=float) * tau[exits["state"].map(self.order).to_numpy()])
 
-        # choose exit state
-        p_absorbing_cumul = np.cumsum(p_absorbing)
+        # Drawing against the running flux rather than a normalized one keeps
+        # the draw strictly inside the last interval.
         r2 = np.random.random()
-        state_exit = np.searchsorted(p_absorbing_cumul, r2)
-
-        return state_exit + len(self.M_abs_reduced) - 1
+        exit_row = int(exits.index[np.searchsorted(flux, r2 * flux[-1])])
+        return exit_row

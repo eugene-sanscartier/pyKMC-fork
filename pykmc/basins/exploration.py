@@ -67,9 +67,12 @@ class BasinGenericEventExplorer(Explorer):
         transition information derived from generic events.
 
         For each event applicable to the current atomic environment:
-            - Determine whether the resulting state is transient or absorbing.
+            - Determine whether it is a fast move, whose state is explored, or
+              a slow one, a candidate exit until the state it reaches is
+              identified.
             - For each atom on which the event can occur, and for each of its
-              symmetry variants, record a connectivity entry.
+              symmetry variants, record a connectivity entry, whatever its
+              share of the state's rate.
 
         Parameters
         ----------

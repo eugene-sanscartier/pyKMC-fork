@@ -13,7 +13,10 @@ from .result import (
     PSROutput,
     RefinementCandidate,
     RefinementTask,
+    geometry_error,
 )
+from .log import fmt_distance
+from .utils.geometry import compute_delr_max
 from .point_set_registration import PointSetRegistration, check_match
 from .utils import geometry
 from .parameters import Parameters
@@ -35,6 +38,9 @@ class PreparedRefinementTask:
     neighbors: np.ndarray
     immediate_result: Result[EventRefinementOutput, ErrorInfo] | None = None
     submit_kwargs: dict = field(default_factory=dict, repr=False)
+    # The saddle as the placement put it, over `neighbors`, kept to judge the
+    # one ARTn returns.
+    saddle_configuration: Configuration | None = None
 
 
 class Refinement:
@@ -66,6 +72,8 @@ class Refinement:
         self.manager = manager
         self.results = None
         self.tasks = []
+        # How many saddle searches each task has cost, counting its retries.
+        self.attempts = []
         self._psr_cache: dict[tuple[int, int], Result[PSROutput, ErrorInfo]] = {}
 
     def execute(self, candidates: list[RefinementCandidate]) -> None:
@@ -83,6 +91,7 @@ class Refinement:
         tasks = self.build_tasks(candidates)
         self.tasks = tasks
         self.results = [None] * len(tasks)
+        self.attempts = [0] * len(tasks)
         for task_id, result in self._run_tasks(tasks).items():
             self.results[task_id] = result
 
@@ -115,6 +124,9 @@ class Refinement:
         if not tasks:
             return {}
 
+        for task in tasks:
+            self.attempts[task.task_id] += 1
+
         future_to_prepared = {}
         for task in log.progress(
             tasks, len(tasks), label="Preparing refinements",
@@ -138,7 +150,10 @@ class Refinement:
                     f"type={type(exc).__name__}", level=logging.ERROR,
                 )
                 raise
-            run_results[prepared.task.task_id] = self._finalize_result(res, prepared)
+            result = self._finalize_result(res, prepared)
+            if not result.is_ok():
+                result.err_value().variables["attempts"] = self.attempts[prepared.task.task_id]
+            run_results[prepared.task.task_id] = result
         return run_results
 
     def _prepare_task(
@@ -149,7 +164,7 @@ class Refinement:
         num_reference_event = task.num_reference_event
         symmetry_index = task.symmetry_index
         dfevent = task.dfevent
-        matching_score_thr = self.params.psr.matching_score_thr + 0.25*self.params.psr.matching_score_thr
+        matching_score_thr = self.params.psr.accept_thr
 
         neighbors = self.neighbors_list.get_neighbors("rcut", at_idx).copy()
 
@@ -212,6 +227,7 @@ class Refinement:
 
         saved_configuration = self.system.configuration.copy()
         self.system.update_positions(new_saddle_configuration, atom_idx=neighbors)
+        placed_saddle = self.system.configuration[neighbors]
         if not task.verify:
             immediate_result = Ok(
                 EventRefinementOutput(
@@ -248,6 +264,7 @@ class Refinement:
             reference_energy_barrier=dfevent["dE_forward"],
             neighbors=neighbors,
             submit_kwargs=submit_kwargs,
+            saddle_configuration=placed_saddle,
         )
 
     def _submit_task(self, prepared: PreparedRefinementTask):
@@ -264,18 +281,23 @@ class Refinement:
     ):
         task = prepared.task
         if res.is_ok():
-            res.ok_value().min2 = prepared.min2_configuration
-            res.ok_value().num_reference_event = task.num_reference_event
-            res.ok_value().symmetry_index = task.symmetry_index
-            res.ok_value().neighbors = prepared.neighbors
-            res.ok_value().saddle = res.ok_value().saddle[prepared.neighbors]
-            res.ok_value().dE_forward = res.ok_value().E_saddle
-            return self.check_refinement_energy(
-                res,
-                abs(res.ok_value().dE_forward - prepared.reference_energy_barrier),
-                self.params.eventsearch.refined_energy_thr,
-                task.num_reference_event,
-            )
+            output = res.ok_value()
+            output.min2 = prepared.min2_configuration
+            output.num_reference_event = task.num_reference_event
+            output.symmetry_index = task.symmetry_index
+            output.neighbors = prepared.neighbors
+            output.saddle = output.saddle[prepared.neighbors]
+            output.dE_forward = output.E_saddle
+            if prepared.immediate_result is None:
+                # Minimum image, so an atom that crossed a boundary reads as
+                # the step it took and not as a lattice vector.
+                output.delr = compute_delr_max(prepared.saddle_configuration, output.saddle)
+                thr = self.params.psr.accept_thr
+                if output.delr > thr:
+                    res = Err(geometry_error("saddle", output.delr, thr))
+
+            if res.is_ok():
+                return res
 
         err = res.err_value()
         if not isinstance(err.variables, dict):
@@ -285,45 +307,52 @@ class Refinement:
         err.variables.setdefault("symmetry_index", task.symmetry_index)
         return res
 
-    def check_refinement_energy(
-        self,
-        result_refine: Result[EventRefinementOutput, ErrorInfo],
-        energy_mismatch: float,
-        refined_energy_thr: float,
-        num_reference_event: int,
-    ) -> Result[EventRefinementOutput, ErrorInfo]:
-        """Check if the energy barrier of the refinement correspond the one of the reference event.
+    # A saddle search that answers neither way is worth asking again on a fresh
+    # seed: ARTn found nothing, or it found something off the placement. An
+    # alignment that failed, or a barrier the engine refuses, would not change.
+    RETRYABLE = (ErrorType.INVALID_GEOMETRY, ErrorType.EVENT_NOT_FOUND)
 
-        Parameters
-        ----------
-        result_refine : Result[EventRefinementOutput, ErrorInfo]
-            Results of the refinement procedure.
-        energy_mismatch : float
-            Difference between the reference event energy barrier and the refine one.
-        refined_energy_thr : float
-            maximum allowed difference (in eV) between a reference event's initial barrier energy and its refined barrier energy
-        num_reference_event : int
-            Reference event this refinement task was attempting, recorded on failure for diagnostics.
+    def rejected_ids(self) -> list[int]:
+        """The task ids whose saddle search did not return the transition asked for."""
+        return [
+            task_id
+            for task_id, result in enumerate(self.results)
+            if result is not None and not result.is_ok()
+            and result.err_value().type in self.RETRYABLE
+        ]
 
-        Returns
-        -------
-        Result[EventRefinementOutput, ErrorInfo]
-            list of results of the procedure.
+    def retry_failed(self) -> None:
+        """Run every saddle search that did not return the transition asked for again, on a fresh seed."""
+        retried = self.rejected_ids()
+        if not retried:
+            return
+        log.info(f"refining again for {len(retried)} saddles", depth=1)
+        self.retry(retried)
+        recovered = sum(1 for task_id in retried if self.results[task_id].is_ok())
+        log.info(f"{recovered} of {len(retried)} retried success", depth=1)
 
-        """
-        if energy_mismatch > refined_energy_thr:
-            return Err(
-                ErrorInfo(
-                    type=ErrorType.REFINEMENT_INVALID_ENERGY_BARRIER,
-                    message="refinement energy barrier does not match reference one",
-                    variables={
-                        "n_ref_event": num_reference_event,
-                        "num_reference_event": num_reference_event,
-                    },
-                )
+    def report(self) -> None:
+        """Report what this pass cost, and which saddle searches never returned the transition asked for."""
+        searched = [task.task_id for task in self.tasks if task.verify]
+        if not searched:
+            return
+
+        spent = sum(self.attempts[task_id] for task_id in searched)
+        log.info(f"{len(searched)} candidates searched, {spent} saddle searches spent", depth=1)
+
+        errors = [self.results[task_id].err_value() for task_id in self.rejected_ids()]
+        delr = [err.variables["delr"] for err in errors if err.type == ErrorType.INVALID_GEOMETRY]
+        not_found = len(errors) - len(delr)
+
+        if delr:
+            log.info(
+                f"{len(delr)} came back off their placement for good"
+                f" (delr {fmt_distance(min(delr))} to {fmt_distance(max(delr))},"
+                f" thr {fmt_distance(self.params.psr.accept_thr)})",
+                depth=1,
             )
-        else:
-            return result_refine
+        if not_found:
+            log.info(f"{not_found} found no saddle at all", depth=1)
 
     def get_successes_results(self) -> list[EventRefinementOutput]:
         """Return successful results.

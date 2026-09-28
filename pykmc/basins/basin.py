@@ -22,9 +22,12 @@ from .. import log
 from ..rate_constant import compute_rate_Eyring
 import pandas as pd
 import copy
+import os
+import pickle
 import numpy as np
 from scipy.spatial import cKDTree
-from pykmc.result import Ok, Err, ErrorInfo, ErrorType, BasinOutput, Result, ShapeID
+from pykmc.algorithms import rank_by_coverage
+from pykmc.result import Ok, Err, ErrorInfo, ErrorType, BasinOutput, BasinSelectorOutput, Result, ShapeID
 
 # TODO: StateDate is here to handle state informations, when State Object will be creates, need to remove
 # TODO: For the moment Basin uses EnergyThresholdDetector, BasinGenericEventExplorer, FPTASelector, need to deal with possible multiple implementation with builder.
@@ -47,6 +50,7 @@ class PlacedEvent:
 
     system: System
     initial_configuration: Configuration
+    saddle_configuration: Configuration
     final_configuration: Configuration
     neighbors: np.ndarray
 
@@ -102,9 +106,11 @@ class StateData:
 
 
 class BasinsGenericEvents:
-    def __init__(self, params: Parameters, reference_table, manager) -> None:
+    def __init__(self, params: Parameters, reference_table, manager, step: int | None = None) -> None:
         self.params = params  # Parameters object with basins parameters
+        self.step = step  # The KMC step this basin belongs to, naming the files `save` writes
         self.explorer = None  # object to explore a state in the basin
+        self.selector = FPTASelector()  # solves the chain for the exit time and the exit transition
         self.reference_table = reference_table  # Object with reference generic events
         self.manager = manager  # object to do external task (minimize, refine)
 
@@ -165,37 +171,26 @@ class BasinsGenericEvents:
         mapping = self.connectivity_table.reorder_states_index()
         self.states = {mapping[old]: val for old, val in self.states.items()}
         self.entry = mapping[self.entry]
-        # Refine absorbing states
-        result = self.refine_absorbing(system)
-        if not result.is_ok():
-            log.debug(f"Basin: exit refinement failed -- {fmt_error(result.err_value())}", depth=2)
-            return result
-        # apply selector algorithm to find t_exit and exit_state
-        log.debug(f"Basin: solving mean exit time over {len(self.states)} states", depth=2)
-        result = self.selector.select_from_connectivity(self.connectivity_table)
+        self.verify_exits()
+        result = self.draw_exit()
         if not result.is_ok():
             log.debug(f"Basin: exit selection failed -- {fmt_error(result.err_value())}", depth=2)
             return result
         # Construct output KMC needs
         t_exit = result.ok_value().t_exit
-        exit_state = result.ok_value().exit_state
+        idx = result.ok_value().exit_row
 
         # The exit is one row of the connectivity table, and the refined saddle
         # and barrier belong to that row: several rows can join the same pair of
         # states on different atoms, so the pair alone does not identify it.
-        # Only the rows that leave the basin were refined, and rows into one
-        # state can disagree about that, so the row is taken from those.
-        exit_row = self.connectivity_table.get_transition_to_state(
-            target_state=exit_state, as_tuples=False, only_exits=True
-        )
-        idx = exit_row.index[0]
-        from_state, event_idx, central_atom, sym_idx, is_transient = (
-            self.connectivity_table.to_tuples(exit_row)[0]
-        )
+        row = self.connectivity_table.df.loc[idx]
+        from_state, exit_state = int(row["state"]), int(row["state_connexion"])
+        central_atom, event_idx = int(row["central_atom"]), int(row["event_connexion"])
         # Ensure from_state is state are full
         self.states[from_state].ensure_full_state(self.params)
+        refined = idx in self.absorbing_saddle_configurations
         log.debug(
-            f"Basin: exit {from_state}->{exit_state},"
+            f"Basin: exit {from_state}->{exit_state} ({'refined' if refined else 'generic'}),"
             f" delr={fmt_distance(self.delr_from_entry(exit_state))} from entry {self.entry},"
             f" t_exit={fmt_time(t_exit)}",
             depth=2,
@@ -204,7 +199,15 @@ class BasinsGenericEvents:
         neighbors = self.states[from_state].neighbors_list.get_neighbors(
             "rcut", central_atom
         )
-        saddle_configuration = self.absorbing_saddle_configurations[idx]
+        # A generic exit is reconstructed from the saddle its event maps to.
+        if refined:
+            saddle_configuration = self.absorbing_saddle_configurations[idx]
+        else:
+            result = self.place_generic_event(from_state, event_idx, central_atom, int(row["sym"]), self.params.psr.accept_thr)
+            if not result.is_ok():
+                log.debug(f"Basin: exit placement failed -- {fmt_error(result.err_value())}", depth=2)
+                return result
+            saddle_configuration = result.ok_value().saddle_configuration
         return Ok(
             BasinOutput(
                 initial_system_configuration=self.states[from_state].system.configuration,
@@ -212,16 +215,37 @@ class BasinsGenericEvents:
                 saddle_configuration=saddle_configuration,
                 final_configuration=self.states[exit_state].system.configuration[neighbors],
                 neighbors=neighbors,
-                dE_forward=self.connectivity_table.df.loc[idx, "dE_forward"],
-                k_tot=self.connectivity_table.df.loc[
-                    self.connectivity_table.df["transient"] == False, "k_forward"
-                ].sum(),
+                dE_forward=row["dE_forward"],
+                k_tot=self.connectivity_table.exits()["k_forward"].sum(),
                 t_exit=t_exit,
                 exit_state=exit_state,
+                exit_row=idx,
                 from_state=from_state,
                 num_reference_event=event_idx,
             )
         )
+    def save(self) -> None:
+        """Write the connectivity table and every materialized state's configuration, for this basin's step.
+
+        `basin_connectivity_<step>.pickle` holds the table and
+        `basin_states_<step>.pickle` holds `{"entry": int, "configurations":
+        {state: Configuration}}`, in the table's own state numbering. Each is
+        replaced only once fully written.
+        """
+        if self.connectivity_table is None or self.step is None:
+            return
+        self.connectivity_table.save(f"basin_connectivity_{self.step}.pickle")
+
+        outfile = f"basin_states_{self.step}.pickle"
+        snapshot = {
+            "entry": self.entry,
+            "configurations": {
+                state: data.system.configuration for state, data in self.states.items() if data.system is not None
+            },
+        }
+        with open(outfile + ".partial", "wb") as file:
+            pickle.dump(snapshot, file)
+        os.replace(outfile + ".partial", outfile)
 
     def delr_from_entry(self, state: int) -> float:
         """Largest per-atom displacement (A) between `state` and the state the basin was entered from."""
@@ -246,7 +270,6 @@ class BasinsGenericEvents:
         self.explorer = BasinGenericEventExplorer(
             params=self.params, reference_table=self.reference_table
         )
-        self.selector = FPTASelector()
         new_system = System.from_configuration(
             system.configuration.copy(), pbc=system.pbc.copy()
         )
@@ -270,6 +293,8 @@ class BasinsGenericEvents:
                 result = self.create_states(pending)
                 if not result.is_ok():
                     return result
+                if self.params.basin.checkpoint:
+                    self.save()
                 continue
 
             # next state to explore :
@@ -404,9 +429,7 @@ class BasinsGenericEvents:
                     placed.system.configuration,
                     placed.neighbors,
                 )
-            outcomes = Reconstruction(self.params, self.manager).reconstruct_many(
-                jobs, self.params.psr.matching_score_thr
-            )
+            outcomes = Reconstruction(self.params, self.manager).reconstruct_many(jobs)
 
             relaxed = {}
             for to_explore, placed in placements.items():
@@ -484,21 +507,25 @@ class BasinsGenericEvents:
         pass
 
     def update_to_explore(self):
-        # Find all state index in the connexion table :
-        unique_states = set(self.connectivity_table.get_table()["state"]).union(
-            set(self.connectivity_table.get_table()["state_connexion"])
-        )
-        self.states_to_explore = list(
-            unique_states.difference(set(self.explored_states))
-        )
+        """Queue every state a fast move reaches that is not yet explored.
 
-    def place_generic_event(self, from_state, event_idx, central_atom, sym_idx):
+        A slow transition's state is left for `verify_exits`, which decides
+        whether it lies inside the basin once all of it is known.
+        """
+        df = self.connectivity_table.get_table()
+        reached = set(df["state"]) | set(df.loc[df["transient"] == True, "state_connexion"])  # noqa: E712
+        self.states_to_explore = list(reached.difference(set(self.explored_states)))
+
+    def place_generic_event(self, from_state, event_idx, central_atom, sym_idx, matching_score_thr=None):
         """Paste the generic event onto `from_state`, ready for `relax_placements` to relax.
 
         Pure geometry: PSR, the symmetry variant and the positions handed to
         the engine. No engine call happens here, so a whole batch of these can
-        be prepared and then relaxed together.
+        be prepared and then relaxed together. `matching_score_thr` defaults
+        to `psr.matching_score_thr`.
         """
+        if matching_score_thr is None:
+            matching_score_thr = self.params.psr.matching_score_thr
 
         ref_event = self.reference_table.table[
             self.reference_table.table["idx_ref"] == event_idx
@@ -534,7 +561,7 @@ class BasinsGenericEvents:
         if not result.is_ok():  # PSR Err
             return result
             # Check if PointSetRegistration match is valid
-        result = check_match(result, self.params.psr.matching_score_thr)
+        result = check_match(result, matching_score_thr)
         if not result.is_ok():  # PSR matching score not valid :
             return result
         else:
@@ -597,99 +624,157 @@ class BasinsGenericEvents:
         placed = PlacedEvent(
             system=new_system,
             initial_configuration=initial_configuration,
+            saddle_configuration=saddle_configuration,
             final_configuration=final_configuration,
             neighbors=neighbors,
         )
         return Ok(placed)
 
-    def refine_absorbing(self, system):
-        """When connectivity table is build, and that we have dict of states, we refine the energy barrier and k_forward of the transient -> absorbing event"""
-        # compute the energy of the state
-        # for all row in connectivity table where we need to refine
-        exits_df = self.connectivity_table.df[self.connectivity_table.df["transient"] == False]
-        log.debug(f"Basin: refining {len(exits_df)} exits", depth=2)
+    def verify_exits(self) -> None:
+        """Identify and refine the exits carrying `control.refine_thr` of the probability the basin is left by.
+
+        Exits are weighed by their share of the absorption. Each leading exit
+        has the state it reaches relaxed, and is folded into the basin if it
+        lands there; once every leading exit is identified, the generic ones
+        are refined. Both move the shares, so the leading group is taken again
+        until all of it is settled. The rest keep the catalogue's barrier and
+        an unidentified landing, and so does a leading exit whose relaxation
+        or refinement fails.
+        """
+        failed = set()
+        while True:
+            exits = self.connectivity_table.exits()
+            if len(exits) == 0:
+                return
+            shares = self.selector.exit_shares(self.connectivity_table, self.entry)
+            ranked, n_leading = rank_by_coverage(list(exits.index), shares, self.params.control.refine_thr)
+            leading = [idx for idx in ranked[:n_leading] if idx not in failed]
+
+            unidentified = [idx for idx in leading if exits.at[idx, "state_connexion"] not in self.states]
+            if unidentified:
+                log.debug(
+                    f"Basin: identifying {len(unidentified)} of {len(exits)} exits"
+                    f" ({n_leading} cover {fmt_number(self.params.control.refine_thr)} of the exit probability)",
+                    depth=2,
+                )
+                failed |= set(self.identify_exits(unidentified))
+                continue
+
+            unrefined = [idx for idx in leading if idx not in self.absorbing_saddle_configurations]
+            if not unrefined:
+                return
+            log.debug(
+                f"Basin: refining {len(unrefined)} of {len(exits)} exits"
+                f" ({n_leading} cover {fmt_number(self.params.control.refine_thr)} of the exit probability)",
+                depth=2,
+            )
+            failed |= self.refine_exits(unrefined)
+
+    def identify_exits(self, rows: list[int]) -> dict[int, Result]:
+        """Relax the state each exit row reaches, and fold it into the basin state it turns out to be.
+
+        Returns, per row whose state could not be placed or relaxed, the
+        failure.
+        """
+        df = self.connectivity_table.df
+        failed = {}
+        placements = {}
+        for idx in rows:
+            row = df.loc[idx]
+            result = self.place_generic_event(
+                int(row["state"]), int(row["event_connexion"]), int(row["central_atom"]), int(row["sym"])
+            )
+            if not result.is_ok():
+                log.status(
+                    f"exit {row['state']:5d}->{row['state_connexion']:<5d}", "PLACE_FAIL",
+                    fmt_error(result.err_value()),
+                )
+                failed[idx] = result
+                continue
+            placements[int(row["state_connexion"])] = result.ok_value()
+
+        relaxed = self.relax_placements(placements)
+
+        for idx in rows:
+            if idx in failed:
+                continue
+            from_state, target = int(df.at[idx, "state"]), int(df.at[idx, "state_connexion"])
+            result = relaxed[target]
+            if not result.is_ok():
+                log.status(f"exit {from_state:5d}->{target:<5d}", "RELAX_FAIL", fmt_error(result.err_value()))
+                failed[idx] = result
+                continue
+
+            existing = self.is_new_state(result.ok_value())
+            if existing == -1:
+                self._add_state(state_index=target, system=result.ok_value(), transient=False)
+                log.status(f"exit {from_state:5d}->{target:<5d}", "EXIT")
+                continue
+            self.connectivity_table.change_state_index(current_index=target, new_index=existing)
+            log.status(f"exit {from_state:5d}->{target:<5d}", "MERGED", f"into state {existing}")
+
+        for idx in rows:
+            self.states[int(df.at[idx, "state"])].release_heavy_objects()
+
+        return failed
+
+    def draw_exit(self) -> Result[BasinSelectorOutput, ErrorInfo]:
+        """Solve the chain and draw the exit row the basin is left by, and when.
+
+        A drawn exit whose landing was never identified is identified now; one
+        that lands inside the basin is a slow move within it, so it is folded
+        in and the chain is solved and drawn again. One whose landing cannot
+        be identified returns why.
+        """
+        while True:
+            log.debug(f"Basin: solving mean exit time over {len(self.states)} states", depth=2)
+            result = self.selector.select_from_connectivity(self.connectivity_table, self.entry)
+            if not result.is_ok():
+                return result
+            idx = result.ok_value().exit_row
+            if self.connectivity_table.df.at[idx, "state_connexion"] in self.states:
+                return result
+
+            failed = self.identify_exits([idx])
+            if idx in failed:
+                return failed[idx]
+            if idx in self.connectivity_table.exits().index:
+                return result
+            log.debug(
+                f"Basin: drawn exit lands on basin state {self.connectivity_table.df.at[idx, 'state_connexion']},"
+                f" drawing again",
+                depth=2,
+            )
+
+    def refine_exits(self, rows: list[int]) -> set[int]:
+        """Refine the barrier of each exit row, returning those whose refinement failed."""
+        df = self.connectivity_table.df
+        failed = set()
 
         futures_context = {}  # idx → { "saddle": f_sad, ... }
-        for idx, row in log.progress(
-            exits_df.iterrows(), len(exits_df), label="Basin exit preparation", reflow=2,
-        ):
-            # tmp_system = copy.deepcopy(self.states[row["state"]].system)
-            tmp_system = System.from_configuration(
-                self.states[row["state"]].system.configuration.copy(), pbc=True
+        for idx in log.progress(rows, len(rows), label="Basin exit preparation", reflow=2):
+            row = df.loc[idx]
+            result = self.place_generic_event(
+                int(row["state"]), int(row["event_connexion"]), int(row["central_atom"]), int(row["sym"]),
+                self.params.psr.accept_thr,
             )
-            # move to generic saddle positions
-            ref_event = self.reference_table.table[
-                self.reference_table.table["idx_ref"] == row["event_connexion"]
-            ]
-            if ref_event.empty:
-                raise ValueError(
-                    f"idx_ref={row['event_connexion']} not found in reference table"
-                )
-            ref_event = ref_event.iloc[0].copy()
-            # ref_event = self.reference_table.table.iloc[row["event_connexion"]].copy()
-            saddle_configuration = ref_event["saddle_configuration"]
-            # Apply PSR between event initial position and environment positions of the central_atoms
-
-            # ENSURE "STATE" FULL
-            self.states[row["state"]].ensure_full_state(self.params)
-
-            result = PointSetRegistration(
-                self.params,
-                tmp_system,
-                ref_event,
-                self.states[row["state"]].neighbors_list,
-                row["central_atom"],
-            ).match()
-            if not result.is_ok():  # PSR Err
-                log.status(
-                    f"exit {row['state']:5d}->{row['state_connexion']:<5d}", "ALIGN_FAIL",
-                    f"atom {row['central_atom']:6d}, event {row['event_connexion']}, "
-                    f"sym {row['sym']:3d}, {fmt_error(result.err_value())}",
-                )
-                return result
-                # Check if PointSetRegistration match is valid
-            matching_score_thr = self.params.psr.matching_score_thr + 0.25 * self.params.psr.matching_score_thr
-            result = check_match(result, matching_score_thr)
-            if not result.is_ok():  # PSR matching score not valid :
+            if not result.is_ok():
                 log.status(
                     f"exit {row['state']:5d}->{row['state_connexion']:<5d}", "ALIGN_FAIL",
                     f"atom {row['central_atom']:6d}, event {row['event_connexion']}, "
                     f"sym {row['sym']:3d}, {fmt_error(result.err_value())}, "
-                    f"matching_score_thr={fmt_number(matching_score_thr)}",
+                    f"accept_thr={fmt_number(self.params.psr.accept_thr)}",
                 )
-                return result
-            else:
-                psr_output = result.ok_value()  # get psr results
-
-            # Apply symmetry matrix if sym != 0
-            if row["sym"] != 0:
-                sym_matrix = ref_event["sym_matrix"][row["sym"]]
-                sym_perm = ref_event["sym_perm"][row["sym"]]
-                # sym_matrix is a rotation about the reference initial
-                # shape's own centroid (ira_mod.SOFI's convention, see
-                # unique_symmetries), not the coordinate origin or
-                # saddle_configuration's own centroid -- pivot on the
-                # initial shape's centroid rather than the raw absolute
-                # positions, or the reconstructed saddle comes out wrong
-                # by roughly the cluster's offset from the origin.
-                pivot = ref_event["initial_configuration"].positions.mean(axis=0)
-                saddle_configuration = geometry.transform_positions(
-                    saddle_configuration - pivot, sym_matrix, 0, sym_perm, wrap=False,
-                ) + pivot
-            saddle_configuration = geometry.transform_positions(
-                saddle_configuration,
-                psr_output.rotation_matrix,
-                psr_output.translation_matrix,
-                psr_output.permutation_matrix,
-            )
-            neighbors = self.states[row["state"]].neighbors_list.get_neighbors(
-                "rcut", row["central_atom"]
-            )
+                failed.add(idx)
+                continue
+            placed = result.ok_value()
+            saddle_configuration = placed.saddle_configuration
+            neighbors = placed.neighbors
 
             future2 = self.manager.partn_refine(
                 self.params,
                 row["central_atom"],
-                configuration=tmp_system.configuration.copy(),
+                configuration=self.states[row["state"]].system.configuration.copy(),
                 saddle_idx=neighbors.copy(),
                 saddle_positions=saddle_configuration.positions.copy(),
             )  # send copy not reference ! -- active_volume routing happens inside partn_refine
@@ -721,7 +806,8 @@ class BasinsGenericEvents:
                     f"exit {ctx['state']:5d}->{ctx['target']:<5d}", "REFINE_FAIL",
                     fmt_error(result_sad.err_value()),
                 )
-                return result_sad
+                failed.add(idx)
+                continue
             dE = result_sad.ok_value().E_saddle
             k = compute_rate_Eyring(dE, self.params)
             catalogue_dE = self.connectivity_table.df.loc[idx, "dE_forward"]
@@ -745,7 +831,7 @@ class BasinsGenericEvents:
             # update connectivity table row
             self.connectivity_table.df.loc[idx, "dE_forward"] = dE
             self.connectivity_table.df.loc[idx, "k_forward"] = k
-        return Ok(None)
+        return failed
 
     def is_new_state(self, system):
         """The index of the state `system` already is, or -1 if it is a new one.

@@ -1,3 +1,5 @@
+import os
+
 import pandas as pd
 
 # TODO: See if separated StatesConnectivity and BasinsStateConnectivity is really usefull.
@@ -112,7 +114,6 @@ class StatesConnectivity:
         target_state: int,
         as_tuples: bool = True,
         return_all: bool = False,
-        only_exits: bool = False,
     ) -> tuple | list[tuple] | pd.DataFrame:
         """Return the transition(s) leading to the specified target state.
 
@@ -131,12 +132,6 @@ class StatesConnectivity:
         return_all : bool, optional (default=False)
             If True, return all possible transitions to `target_state`.
             If False, return only the first transition starting from the smallest `state`.
-        only_exits : bool, optional (default=False)
-            If True, consider only the transitions that leave the basin
-            (`transient == False`) -- the ones `refine_absorbing` gives a
-            refined barrier and saddle to. `transient` is written per
-            transition from the event's own barrier, so transitions reaching
-            one state can disagree about it.
 
         Returns
         -------
@@ -152,8 +147,6 @@ class StatesConnectivity:
 
         # Find sub dataframe with state_connexion == target_state
         sub_df = self.df[self.df["state_connexion"] == target_state]
-        if only_exits:
-            sub_df = sub_df[sub_df["transient"] == False]  # noqa: E712
 
         if not return_all:
             # Return the first transition with lower from state
@@ -162,6 +155,15 @@ class StatesConnectivity:
             return self.to_tuples(sub_df)[0] if as_tuples else sub_df
         else:
             return self.to_tuples(sub_df) if as_tuples else sub_df
+
+    def exits(self) -> pd.DataFrame:
+        """The transitions that leave the basin: those reaching a state nothing was explored out of.
+
+        Where a transition lands, not its barrier, decides it: a slow
+        transition folded into an explored state is a move within the basin.
+        """
+        exits = self.df[~self.df["state_connexion"].isin(set(self.df["state"]))]
+        return exits
 
     def get_table(self) -> pd.DataFrame:
         """
@@ -233,14 +235,16 @@ class StatesConnectivity:
 
     def save(self, outfile: str = "basin_connectivity.pickle") -> None:
         """
-        Save the connectivity DataFrame to a pickle file.
+        Save the connectivity DataFrame to a pickle file, replacing it only once fully written.
 
         Parameters
         ----------
         outfile : str, optional
             Output filename. Default is 'basin_connectivity.pickle'.
         """
-        self.df.to_pickle(outfile)
+        partial = outfile + ".partial"
+        self.df.to_pickle(partial)
+        os.replace(partial, outfile)
 
     def clear(self):
         """Reset the connectivity table to an empty DataFrame."""
