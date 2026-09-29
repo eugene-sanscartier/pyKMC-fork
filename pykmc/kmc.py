@@ -355,10 +355,7 @@ class KMC:
                 log.info("Exploring the Basin.", depth=1)
                 # get basin info/explore
                 basin = BasinsGenericEvents(self.params, self.reference_table, self.manager, step)
-                self.system.update_positions(
-                    result_reconstruction.ok_value().min1_configuration
-                )
-                result_basin = basin.execute(self.system)
+                result_basin = basin.execute(self.system, atom_shapes)
                 if result_basin.is_ok():  # Basin did no fail
                     if log.is_debug_enabled():
                         basin_output = result_basin.ok_value()
@@ -428,6 +425,8 @@ class KMC:
                             f"{fmt_error(result_basin_reconstruction.err_value())}, back to original event",
                             depth=1,
                         )
+                elif result_basin.err_value().type == ErrorType.BASIN_ENTRY_NOT_SEARCHED:
+                    log.info(f"{fmt_error(result_basin.err_value())}, back to original event", depth=1)
                 else:
                     log.info(
                         f"Basin fails with error : {fmt_error(result_basin.err_value())}, back to original event",

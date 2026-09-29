@@ -122,7 +122,8 @@ class ErrorType(Enum):
     # `thr` it missed.
     INVALID_GEOMETRY = 41
     BASIN_TEXIT_NOT_FOUND = 51
-    BASIN_UNKNOWN_INITIAL_ENVIRONMENT = 52
+    # The entry state holds a shape whose own search has not closed.
+    BASIN_ENTRY_NOT_SEARCHED = 52
 
 
 GEOMETRY_STAGES = ("saddle", "min1", "min2")

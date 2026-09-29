@@ -62,8 +62,9 @@ class StateData:
     neighbors_list: Optional[NeighborsList]
     transient: bool = False
     visited: bool = False
-    # Every non-crystal atom's resolved ShapeID, set by unknown_environment()
-    # only once the whole state passes the gate; None means "not
+    # Every non-crystal atom's resolved ShapeID: the step's own for state 0,
+    # set by unknown_environment() for any other state once the whole state
+    # passes the gate; None means "not
     # established", never "no shapes". Survives release_heavy_objects():
     # nothing during basin exploration can invalidate it, since no search
     # runs and so the shape catalog cannot change.
@@ -126,12 +127,13 @@ class BasinsGenericEvents:
         # transitions can join the same pair of states, on different atoms.
         self.absorbing_saddle_configurations: dict[int, Configuration] = {}
 
-    def execute(self, system):
-        """
-        run the basin exploration and select an event from a system, corresponding to the first state in the basin, it is assumed that this state is transient.
+    def execute(self, system, atom_shapes: dict[int, ShapeID]):
+        """Explore the basin entered at `system` and select its exit event.
+
+        `atom_shapes` is every non-crystal atom's `ShapeID` in `system`, as the step resolved it.
         """
         # initialize the basin
-        self._initialize(system)
+        self._initialize(system, atom_shapes)
         log.debug(f"Basin: entered at state {self.current_state}, style '{self.params.basin.style}'", depth=2)
 
         # A basin is many small independent engine calls -- one relaxation per
@@ -140,23 +142,17 @@ class BasinsGenericEvents:
         # than on the single global engine.
         self.manager.use_local()
 
-        # Every state discovered *during* exploration gets this check inside
-        # construct_connexion_table()'s loop before being explored -- but
-        # state 0 is pre-added by _initialize() and never passes through
-        # that branch, so it has to be checked here instead. Without this,
-        # a state 0 with an uncatalogued atom silently explores to zero
-        # connectivity entries, and reorder_states_index() then returns an
-        # empty mapping that doesn't cover state 0's own index.
+        # State 0's shapes come from the step itself, so each one is
+        # catalogued; a shape whose search is still open would leave state 0
+        # without its events.
         self.states[0].ensure_full_state(self.params)
-        unknown = self.unknown_environment(self.states[0])
-        if unknown is not None:
-            log.debug(f"Basin: entry state 0 rejected -- {unknown}", depth=2)
-            return Err(
-                ErrorInfo(
-                    type=ErrorType.BASIN_UNKNOWN_INITIAL_ENVIRONMENT,
-                    message="Basin: cannot be entered -- {}.".format(unknown),
-                )
-            )
+        shapes = self.reference_table.shapes
+        open_atom = next((atom for atom, shape in atom_shapes.items() if shapes.needs_search(shape)), None)
+        if open_atom is not None:
+            shape = atom_shapes[open_atom]
+            reason = f"atom {open_atom} has shape {fmt_hash(shape.id)}#{shape.sid}, whose own search is still '{shapes.get_shape_knowledge(shape).status}'"
+            log.debug(f"Basin: entry state 0 not entered -- {reason}", depth=2)
+            return Err(ErrorInfo(type=ErrorType.BASIN_ENTRY_NOT_SEARCHED, message=f"Basin: not entered -- {reason}."))
         log.debug(
             f"Basin: entry state 0 known ({len(self.states[0].atom_shapes)} non-crystal atoms)",
             depth=2,
@@ -254,7 +250,7 @@ class BasinsGenericEvents:
             self.states[state].system.configuration,
         )
 
-    def _initialize(self, system) -> None:
+    def _initialize(self, system, atom_shapes: dict[int, ShapeID]) -> None:
         """
         Initialize necessary component after entering in basin. We always enter in state == 0.
         """
@@ -276,6 +272,7 @@ class BasinsGenericEvents:
         self._add_state(
             state_index=0, system=new_system
         )  # add current state 0 to self.states
+        self.states[0].atom_shapes = atom_shapes
 
     def construct_connexion_table(self):
         """

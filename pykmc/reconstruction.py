@@ -67,8 +67,9 @@ class Reconstruction:
             key -> `(supposed_min1, supposed_min2, saddle, neighbors)`, each
             entry as :meth:`reconstruct` takes them.
 
-        Each minimum is judged against its prediction at `psr.accept_thr`.
+        min1 is judged against its prediction at `psr.matching_score_thr`, min2 at `psr.accept_thr`.
         """
+        matching_thr = self.params.psr.matching_score_thr
         accept_thr = self.params.psr.accept_thr
         jobs = {
             key: (min1, min2, saddle, np.arange(len(saddle)) if neighbors is None else neighbors)
@@ -88,9 +89,10 @@ class Reconstruction:
         for key, (min1, _, _, neighbors) in jobs_items:
             min1_configuration, _ = futures[key].result()
 
+            # min1 is the state the system stands in, so it is held to identity.
             delr1 = compute_delr_max(min1, wrap_configuration(min1_configuration)[neighbors])
-            if delr1 > accept_thr:
-                results[key] = Err(geometry_error("min1", delr1, accept_thr))
+            if delr1 > matching_thr:
+                results[key] = Err(geometry_error("min1", delr1, matching_thr))
             else:
                 min1_configurations[key] = min1_configuration
 
