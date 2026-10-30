@@ -9,15 +9,21 @@ independent of how many (if any) transitions currently reference them.
 from __future__ import annotations
 
 import pickle
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Iterator, Literal
+
+import numpy as np
 
 from .parameters import Parameters
 from .system import System, Configuration
 from .neighbors_list import NeighborsList
-from .result import ShapeID, SaddleID
-from .point_set_registration import simple_ira, check_match
-from .utils.geometry import unwrap_around
+from .result import ShapeID, SaddleID, Result, ErrorInfo
+from .point_set_registration import Alignment, Cluster, align, cut_cluster
+from .utils.io_utils import write_pickle
+
+# How far a shape's searching has got, for keeping the more advanced of two records.
+PROGRESS = {"unsearched": 0, "opportunistic": 1, "completed": 2}
 
 
 @dataclass
@@ -193,216 +199,214 @@ class ShapeTable:
     params : Parameters
         The atomic simulations configuration.
 
+    Attributes
+    ----------
+    aliases : dict[str, list[ShapeID | SaddleID]]
+        The entries each `topo_id` is also tried against.
+    merged : dict[ShapeID, ShapeID]
+        Each fused minimum and the minimum it was fused into.
+    pending : list[tuple[ShapeID, ShapeID, Cluster]]
+        Fusions not yet run: the minimum, the one it goes into, and the cluster both matched.
+
     """
 
     def __init__(self, params: Parameters) -> None:
         self.params = params
+        self.shape_knowledge: dict[ShapeID, ShapeKnowledge] = {}
+        self.saddle_knowledge: dict[SaddleID, SaddleKnowledge] = {}
+        self.aliases: dict[str, list[ShapeID | SaddleID]] = {}
+        self.merged: dict[ShapeID, ShapeID] = {}
+        self.pending: list[tuple[ShapeID, ShapeID, Cluster]] = []
         if params.control.topology_search_status is not None:
             with open(params.control.topology_search_status, "rb") as file:
                 data = pickle.load(file)
-            self.shape_knowledge: dict[ShapeID, ShapeKnowledge] = data["shape_knowledge"]
-            self.saddle_knowledge: dict[SaddleID, SaddleKnowledge] = data["saddle_knowledge"]
-        else:
-            self.shape_knowledge: dict[ShapeID, ShapeKnowledge] = {}
-            self.saddle_knowledge: dict[SaddleID, SaddleKnowledge] = {}
-        self._shape_by_id: dict[str, list] = {}
-        self._shape_indexed = 0
-        self._saddle_by_id: dict[str, list] = {}
-        self._saddle_indexed = 0
+            self.shape_knowledge = data["shape_knowledge"]
+            self.saddle_knowledge = data["saddle_knowledge"]
+            # Catalogues written before aliasing and fusion carry none.
+            self.aliases = data.get("aliases", {})
+            self.merged = data.get("merged", {})
+            self.pending = data.get("pending", [])
+
+        self._index: dict[str, dict[str, list]] = {"minimum": {}, "saddle": {}}
+        self._indexed = {"minimum": -1, "saddle": -1}
+        self._age: dict[ShapeID | SaddleID, int] = {}
 
     def known_ids(self) -> set[str]:
         """The `id_initial` values with at least one catalogued shape."""
         return {shape.id for shape in self.shape_knowledge}
 
-    @staticmethod
-    def index_by_id(knowledge: dict) -> dict:
-        """Precompute {topo_id: sorted [shapes sharing it]} over `knowledge`, to pass into
-        `_classify`'s `by_id` -- skips its default O(n) per-call scan of the whole dict. Meant for a
-        caller's own frozen snapshot (e.g. reconciling many candidates against one fixed prior-state
-        copy) that `self.shape_knowledge`/`self.saddle_knowledge` themselves don't need: `_classify`/
-        `_resolve` already maintain and reuse their own live index for those two (`_live_index`)."""
-        index: dict = {}
-        for shape in sorted(knowledge):
-            index.setdefault(shape.id, []).append(shape)
-        return index
+    def _knowledge(self, kind: Literal["minimum", "saddle"]) -> dict:
+        """The catalog of `kind`."""
+        return self.shape_knowledge if kind == "minimum" else self.saddle_knowledge
 
-    def _live_index(self, knowledge: dict) -> dict | None:
-        """The persistent, incrementally-maintained {topo_id: [shapes], ascending sid} index behind
-        `self.shape_knowledge`/`self.saddle_knowledge` -- `None` for any other dict (a caller's own
-        snapshot has no persistent index to offer; use `index_by_id` for those instead).
+    def _topo_index(self, kind: Literal["minimum", "saddle"]) -> dict[str, list]:
+        """`{topo_id: [entries]}` over the `kind` catalog, kept by `resolve` and `retire` and rebuilt when the catalog changed elsewhere."""
+        knowledge = self._knowledge(kind)
+        if self._indexed[kind] != len(knowledge):
+            index: dict[str, list] = {}
+            for shape in knowledge:
+                index.setdefault(shape.id, []).append(shape)
+            self._index[kind], self._indexed[kind] = index, len(knowledge)
+        return self._index[kind]
 
-        Both dicts only ever grow by appending a new key (`_resolve`'s mint, or the handful of
-        `setdefault` calls elsewhere in this class) -- never replaced or removed -- and every mint
-        assigns `max(existing sid for this topo_id) + 1`, so entries for one topo_id are already in
-        ascending-sid order as inserted. Catching up after new entries just means indexing whatever's
-        been appended since the last call, not rebuilding from scratch: turns what would otherwise be
-        an O(n) rescan of the whole table on every single classification (profiled: the dominant cost
-        of reconciling shapes across independent runs, where a live run's own `self.shape_knowledge`
-        can hold tens of thousands of entries by the time it's read back) into one O(1) amortized
-        lookup per call."""
-        if knowledge is self.shape_knowledge: by_id, attr = self._shape_by_id, "_shape_indexed"
-        elif knowledge is self.saddle_knowledge: by_id, attr = self._saddle_by_id, "_saddle_indexed"
-        else: return None
+    def canonical(self, shape: ShapeID | SaddleID) -> ShapeID | SaddleID:
+        """The minimum `shape` was fused into, or `shape` itself."""
+        while shape in self.merged:
+            shape = self.merged[shape]
+        return shape
 
-        items = list(knowledge.items())
-        for shape, _ in items[getattr(self, attr):]: by_id.setdefault(shape.id, []).append(shape)
-        setattr(self, attr, len(items))
-        return by_id
+    def match(self, shape: ShapeID | SaddleID, cluster: Cluster, thr: float) -> Result[Alignment, ErrorInfo]:
+        """Match `shape`'s representative into `cluster` within `thr`."""
+        entry = (self.shape_knowledge if isinstance(shape, ShapeID) else self.saddle_knowledge)[shape]
+        alignment = align(entry.rep_config, entry.rep_atom_idx, cluster, self.params, thr)
+        return alignment
 
-    def _classify(
+    def _candidates(self, kind: Literal["minimum", "saddle"], topo_id: str, also: list) -> list:
+        """The entries `topo_id` is tried against: its own, those it is an alias of, and `also`; an entry with no representative yet is none."""
+        key_cls = ShapeID if kind == "minimum" else SaddleID
+        knowledge = self._knowledge(kind)
+        own = self._topo_index(kind).get(topo_id, [])
+        aliased = [shape for shape in self.aliases.get(topo_id, []) if isinstance(shape, key_cls)]
+        candidates = [shape for shape in dict.fromkeys(self.canonical(shape) for shape in [*own, *aliased, *also]) if knowledge[shape].rep_config is not None]
+        return candidates
+
+    def _alias(self, topo_id: str, shape: ShapeID | SaddleID) -> None:
+        """List `shape` under `topo_id`, unless it is minted there or already listed."""
+        if shape.id != topo_id and shape not in self.aliases.get(topo_id, []):
+            self.aliases[topo_id] = self.aliases.get(topo_id, []) + [shape]
+
+    def resolve(
         self,
-        knowledge: dict,
+        kind: Literal["minimum", "saddle"],
         topo_id: str,
-        configuration: Configuration,
-        move_atom_idx: int | None = None,
-        by_id: dict | None = None,
-    ) -> int | None:
-        """Match `configuration` against every representative in `knowledge` sharing `topo_id`; `None` if none match.
-
-        Shared mechanism behind minima/saddle classification, live or
-        cataloguing-time: `knowledge` (`self.shape_knowledge` or
-        `self.saddle_knowledge`) already holds exactly one representative
-        geometry per entry, so this is a single IRA/PSR comparison per
-        candidate sid, tried in ascending sid order for determinism.
+        cluster: Cluster,
+        *,
+        also: list = (),
+        fallback: list = (),
+        mint: bool = True,
+    ) -> ShapeID | SaddleID | None:
+        """Classify `cluster` within the `kind` catalog, minting an entry under `topo_id` when nothing matches.
 
         Parameters
         ----------
-        knowledge : dict[ShapeID, ShapeKnowledge] | dict[SaddleID, SaddleKnowledge]
+        kind : Literal["minimum", "saddle"]
             The catalog to classify against.
         topo_id : str
-            The candidate's coarse topology hash (``id_initial`` or ``id_saddle``).
-        configuration : Configuration
-            The candidate's local-cluster types/positions/cell.
-        move_atom_idx : int | None
-            Index of the candidate's own central/moving atom within ``configuration``, if known -- seeds the IRA search against each representative's own ``rep_atom_idx`` instead of leaving it to find a geometric center.
-        by_id : dict | None
-            Optional `index_by_id(knowledge)` result -- when given, replaces the default O(n) scan
-            of `knowledge` with an O(1) lookup. Only pass this for a `knowledge` frozen for the whole
-            span the index is reused over; omit it (the default) for anything still being mutated.
+            The cluster's topology hash.
+        cluster : Cluster
+            The geometry, from `cut_cluster`.
+        also : list
+            Entries also tried.
+        fallback : list
+            Entries tried only when nothing else matches.
+        mint : bool
+            Whether to mint when nothing matches.
 
         Returns
         -------
-        int | None
-            The matching sid, or `None` if nothing under `topo_id` matches
-            (including the case where nothing is catalogued under it at all).
+        ShapeID | SaddleID | None
+            The cluster's entry, or `None` when nothing matches and `mint` is off.
 
         """
-        full = self.params.atomicenvironment.coloring_mode == "full"
-        if by_id is None: by_id = self._live_index(knowledge)
-        candidates = by_id.get(topo_id, []) if by_id is not None else sorted(shape for shape in knowledge if shape.id == topo_id)
-        for shape in candidates:
-            know = knowledge[shape]
-            result = simple_ira(
-                configuration,
-                know.rep_config,
-                self.params.ira.kmax_factor,
-                full=full,
-                candidate1=move_atom_idx,
-                candidate2=know.rep_atom_idx,
-            )
-            if check_match(result, self.params.psr.matching_score_thr).is_ok():
-                return shape.sid
-        return None
+        thr = self.params.psr.matching_score_thr
+        first = self._candidates(kind, topo_id, also)
+        rest = [shape for shape in self._candidates(kind, topo_id, fallback) if shape not in first]
+        if any(shape not in self._age for shape in [*first, *rest]):
+            # Catalogs keep minting order.
+            self._age = {shape: i for i, shape in enumerate([*self.shape_knowledge, *self.saddle_knowledge])}
 
-    def _resolve(
-        self,
-        knowledge: dict,
-        key_cls,
-        entry_cls,
-        topo_id: str,
-        configuration: Configuration,
-        move_atom_idx: int | None,
-    ) -> int:
-        """Classify-or-mint: match `configuration` against `knowledge` under `topo_id`, minting a fresh entry if nothing matches.
+        # Oldest first. A minimum is tried against every candidate, to find fusions; a saddle is never fused and stops at its first match.
+        matches = []
+        for candidates in (first, rest):
+            for shape in sorted(candidates, key=self._age.__getitem__):
+                if self.match(shape, cluster, thr).is_ok():
+                    matches += [shape]
+                    if kind == "saddle":
+                        break
+            if matches:
+                break
 
-        Shared mechanism behind `resolve_sid` (minima or saddle -- `key_cls`/
-        `entry_cls` select which) and `resolve_live_shape`'s mint path.
-        """
-        by_id = self._live_index(knowledge)
-        sid = self._classify(knowledge, topo_id, configuration, move_atom_idx, by_id=by_id)
-        if sid is not None:
-            return sid
+        if matches:
+            # The oldest match keeps its ID.
+            winner = matches[0]
+            self._alias(topo_id, winner)
+            if kind == "minimum":
+                self.pending += [(shape, winner, cluster) for shape in matches[1:]]
+            return winner
+        if not mint:
+            return None
 
-        existing = [shape.sid for shape in by_id.get(topo_id, [])] if by_id is not None else [shape.sid for shape in knowledge if shape.id == topo_id]
-        new_sid = max(existing) + 1 if existing else 0
-        knowledge[key_cls(topo_id, new_sid)] = entry_cls(
-            rep_config=configuration, rep_atom_idx=move_atom_idx
-        )
-        return new_sid
+        # A new entry, represented by the cluster's atoms within rcut.
+        positions = cluster.configuration.positions
+        radii = np.linalg.norm(positions - positions[cluster.center], axis=1)
+        rows = np.flatnonzero(radii <= self.params.atomicenvironment.rcut)
 
-    def resolve_sid(
-        self,
-        kind: Literal["initial", "saddle"],
-        topo_id: str,
-        configuration: Configuration,
-        move_atom_idx: int | None = None,
-    ) -> int:
-        """Resolve a candidate geometry's sid under `topo_id`, within the `kind` catalog -- together they form its `ShapeID`/`SaddleID`.
+        # A fused minimum's sid still resolves to its survivor.
+        key_cls, entry_cls = (ShapeID, ShapeKnowledge) if kind == "minimum" else (SaddleID, SaddleKnowledge)
+        index = self._topo_index(kind)
+        taken = [shape.sid for shape in [*index.get(topo_id, []), *self.merged] if shape.id == topo_id and isinstance(shape, key_cls)]
+        shape = key_cls(topo_id, max(taken) + 1 if taken else 0)
+        self._knowledge(kind)[shape] = entry_cls(rep_config=cluster.configuration[rows], rep_atom_idx=int(np.flatnonzero(rows == cluster.center)[0]))
+        index.setdefault(topo_id, []).append(shape)
+        self._indexed[kind] += 1
+        self._age[shape] = len(self._age)
+        return shape
 
-        `kind="initial"` classifies against `self.shape_knowledge` (minima).
-        `kind="saddle"` classifies against `self.saddle_knowledge`,
-        free-standing -- the same transition-state geometry is recognized as
-        one catalogued saddle regardless of which reaction pathway reaches
-        it, unlike the old pathway-scoped resolution this replaced. Either
-        way, if nothing matches, this candidate becomes a freshly minted
-        entry's own permanent representative.
-        """
-        if kind == "initial":
-            knowledge, key_cls, entry_cls = self.shape_knowledge, ShapeID, ShapeKnowledge
-        else:
-            knowledge, key_cls, entry_cls = self.saddle_knowledge, SaddleID, SaddleKnowledge
-        return self._resolve(knowledge, key_cls, entry_cls, topo_id, configuration, move_atom_idx)
+    def fusions(self) -> Iterator[tuple[ShapeID, ShapeID]]:
+        """Empty the queue, yielding each fusion that still holds: the minimum and the one it goes into."""
+        pending, self.pending = self.pending, []
+        thr = self.params.psr.matching_score_thr
 
-    def _live_configuration(
-        self, system: System, neighbors_list: NeighborsList, atom_idx: int
-    ) -> tuple[Configuration, int]:
-        """This atom's own rcut-neighbor cluster, unwrapped around itself, and its own index within it."""
-        nl = neighbors_list.get_neighbors("rcut", atom_idx).copy()
-        cfg = unwrap_around(system.configuration[nl], system.positions[atom_idx])
-        return cfg, nl.index(atom_idx)
+        for shape, into, cluster in pending:
+            # Read after the previous fusion was run.
+            shape, into = self.canonical(shape), self.canonical(into)
+            if shape == into:
+                continue
 
-    def classify_live_sid(
-        self,
-        system: System,
-        neighbors_list: NeighborsList,
-        central_atom_index: int,
-        id_initial: str,
-    ) -> int | None:
-        """Classify a live atom's ``sid_initial`` against already-catalogued shapes sharing its ``id_initial``.
+            # An earlier fusion may have replaced either side by a shape this cluster does not match.
+            if self.match(shape, cluster, thr).is_ok() and self.match(into, cluster, thr).is_ok():
+                yield shape, into
 
-        Unlike `resolve_sid` (used when cataloguing a freshly found event,
-        which always assigns a new sid if none match), this never invents
-        one: it only reports whether the atom's current geometry already
-        matches a known `ShapeID`, so callers can decide whether a fresh
-        event search is warranted for it.
+    def retire(self, shape: ShapeID, into: ShapeID, renamed: dict[int, int]) -> None:
+        """Fuse minimum `shape` into `into`: drop its representative, fold its knowledge into `into`'s, and rename the events in `renamed` everywhere.
 
         Parameters
         ----------
-        system : System
-            The live atomic system.
-        neighbors_list : NeighborsList
-            The system's neighbor lists.
-        central_atom_index : int
-            Index of the atom to classify.
-        id_initial : str
-            The atom's coarse topology hash.
-
-        Returns
-        -------
-        int | None
-            The matching ``sid_initial``, or ``None`` if the atom's live
-            geometry matches no `ShapeID` already catalogued under
-            ``id_initial`` (including the case where ``id_initial`` has no
-            rows at all).
+        shape : ShapeID
+            The minimum fused.
+        into : ShapeID
+            The minimum it is fused into.
+        renamed : dict[int, int]
+            The `idx_ref` each dropped event is now known as.
 
         """
-        if not any(shape.id == id_initial for shape in self.shape_knowledge):
-            return None
+        self._topo_index("minimum")[shape.id].remove(shape)
+        source = self.shape_knowledge.pop(shape)
+        self._indexed["minimum"] -= 1
+        self.merged[shape] = into
 
-        live_configuration, move_atom_idx = self._live_configuration(
-            system, neighbors_list, central_atom_index
-        )
-        return self._classify(self.shape_knowledge, id_initial, live_configuration, move_atom_idx)
+        target = self.shape_knowledge[into]
+        target.rediscovery_counts = dict(Counter(target.rediscovery_counts) + Counter(source.rediscovery_counts))
+        target.known_rates = {**source.known_rates, **target.known_rates}
+        target.known_barriers = {**source.known_barriers, **target.known_barriers}
+        target.search_log += source.search_log
+        target.escalated = target.escalated or source.escalated
+        target.status = max(target.status, source.status, key=PROGRESS.get)
+        if target.final_state is None:
+            target.final_state, target.final_fraction = source.final_state, source.final_fraction
+
+        for know in self.shape_knowledge.values():
+            counts = Counter()
+            for idx_ref, count in know.rediscovery_counts.items():
+                counts[renamed.get(idx_ref, idx_ref)] += count
+            know.rediscovery_counts = dict(counts)
+            know.known_rates = {renamed.get(idx_ref, idx_ref): k for idx_ref, k in know.known_rates.items()}
+            know.known_barriers = {renamed.get(idx_ref, idx_ref): barriers for idx_ref, barriers in know.known_barriers.items()}
+            know.search_log = [SearchRecord(record.outcome, renamed.get(record.idx_ref, record.idx_ref)) for record in know.search_log]
+
+        for topo_id, shapes in self.aliases.items():
+            self.aliases[topo_id] = list(dict.fromkeys(into if other == shape else other for other in shapes))
+        self._alias(shape.id, into)
 
     def resolve_live_shape(
         self,
@@ -413,29 +417,34 @@ class ShapeTable:
         *,
         mint: bool,
     ) -> ShapeID | None:
-        """Resolve one atom's live `ShapeID`.
+        """One live atom's `ShapeID`, minted from its own cluster when nothing matches and `mint` is set.
 
-        With `mint=False`, never invents one: `None` if the atom's current
-        geometry matches nothing already catalogued under its `id_initial`,
-        so a caller can decide whether a fresh search is warranted at all.
+        Parameters
+        ----------
+        system : System
+            The live system.
+        neighbors_list : NeighborsList
+            The system's neighbour lists.
+        atomic_environment : AtomicEnvironment
+            The system's environments, giving the atom's `id_initial`.
+        atom_idx : int
+            The atom.
+        mint : bool
+            Whether to mint when nothing matches.
 
-        With `mint=True`, always returns a real `ShapeID`, minting one backed
-        by the atom's own geometry if nothing matches -- meant to be called
-        once a search has already been dispatched for this atom: by then
-        there's nothing left to decide, only a shape left to record
-        knowledge against, event or no event. The minted representative is
-        this atom's own rcut-neighbor cluster, unwrapped around itself, not
-        anything the dispatched search returns, so this never has to wait on
-        (or depend on the outcome of) that search.
+        Returns
+        -------
+        ShapeID | None
+            The shape, or `None` when nothing matches and `mint` is off.
+
         """
         id_initial = atomic_environment.atomic_environment_list[atom_idx]
-        if not mint:
-            sid = self.classify_live_sid(system, neighbors_list, atom_idx, id_initial)
-            return None if sid is None else ShapeID(id_initial, sid)
+        if not mint and not self._candidates("minimum", id_initial, []):
+            return None
 
-        live_configuration, move_atom_idx = self._live_configuration(system, neighbors_list, atom_idx)
-        sid = self.resolve_sid("initial", id_initial, live_configuration, move_atom_idx)
-        return ShapeID(id_initial, sid)
+        cluster = cut_cluster(system.configuration, neighbors_list, atom_idx, self.params)
+        shape = self.resolve("minimum", id_initial, cluster, mint=mint)
+        return shape
 
     def record_shape_knowledge(
         self,
@@ -536,8 +545,5 @@ class ShapeTable:
         """Save the shape catalogs to `params.control.topology_search_status_output`, if set."""
         if self.params.control.topology_search_status_output is None:
             return
-        with open(self.params.control.topology_search_status_output, "wb") as file:
-            pickle.dump(
-                {"shape_knowledge": self.shape_knowledge, "saddle_knowledge": self.saddle_knowledge},
-                file,
-            )
+        data = {key: getattr(self, key) for key in ("shape_knowledge", "saddle_knowledge", "aliases", "merged", "pending")}
+        write_pickle(data, self.params.control.topology_search_status_output)

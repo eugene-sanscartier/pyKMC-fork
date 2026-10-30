@@ -71,7 +71,7 @@ class DetectorThreshold(Detector):
                 pds_generic_event_forward = pds_selected_active_event
 
             # idx_backward already links this row to its real reverse event,
-            # resolved once at cataloguing time (see ShapeTable.resolve_sid()) --
+            # resolved once at cataloguing time (see ShapeTable.resolve()) --
             # no need to re-derive a candidate via a coarse id_initial/id_final
             # hash filter plus a geometric re-confirmation. That re-derivation
             # used to compare final_configuration (built to share

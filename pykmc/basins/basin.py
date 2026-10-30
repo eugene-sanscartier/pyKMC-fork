@@ -12,18 +12,16 @@ from pykmc import (
     AtomicEnvironment,
     ReferenceEventTable,
     PointSetRegistration,
-    check_match,
     Reconstruction,
 )
 from typing import Optional
 from ..utils import geometry
+from ..utils.io_utils import write_pickle
 from ..log import fmt_hash, fmt_distance, fmt_energy, fmt_error, fmt_number, fmt_rate, fmt_time
 from .. import log
 from ..rate_constant import compute_rate_Eyring
 import pandas as pd
 import copy
-import os
-import pickle
 import numpy as np
 from scipy.spatial import cKDTree
 from pykmc.algorithms import rank_by_coverage
@@ -239,9 +237,7 @@ class BasinsGenericEvents:
                 state: data.system.configuration for state, data in self.states.items() if data.system is not None
             },
         }
-        with open(outfile + ".partial", "wb") as file:
-            pickle.dump(snapshot, file)
-        os.replace(outfile + ".partial", outfile)
+        write_pickle(snapshot, outfile)
 
     def delr_from_entry(self, state: int) -> float:
         """Largest per-atom displacement (A) between `state` and the state the basin was entered from."""
@@ -554,15 +550,10 @@ class BasinsGenericEvents:
             ref_event,
             self.states[from_state].neighbors_list,
             central_atom,
-        ).match()
-        if not result.is_ok():  # PSR Err
+        ).match(matching_score_thr)
+        if not result.is_ok():
             return result
-            # Check if PointSetRegistration match is valid
-        result = check_match(result, matching_score_thr)
-        if not result.is_ok():  # PSR matching score not valid :
-            return result
-        else:
-            psr_output = result.ok_value()  # get psr results
+        alignment = result.ok_value()
 
         # Apply PSR to generic event to move
 
@@ -585,29 +576,14 @@ class BasinsGenericEvents:
             final_configuration = geometry.transform_positions(
                 final_configuration - pivot, sym_matrix, 0, sym_perm, wrap=False,
             ) + pivot
-        initial_configuration = geometry.transform_positions(
-            initial_configuration,
-            psr_output.rotation_matrix,
-            psr_output.translation_matrix,
-            psr_output.permutation_matrix,
-        )
-        saddle_configuration = geometry.transform_positions(
-            saddle_configuration,
-            psr_output.rotation_matrix,
-            psr_output.translation_matrix,
-            psr_output.permutation_matrix,
-        )
-        final_configuration = geometry.transform_positions(
-            final_configuration,
-            psr_output.rotation_matrix,
-            psr_output.translation_matrix,
-            psr_output.permutation_matrix,
-        )
-
-        # Move system do saddle positions
         neighbors = self.states[from_state].neighbors_list.get_neighbors(
             "rcut", central_atom
         )
+        initial_configuration = alignment.place(initial_configuration, neighbors)
+        saddle_configuration = alignment.place(saddle_configuration, neighbors)
+        final_configuration = alignment.place(final_configuration, neighbors)
+
+        # Move system do saddle positions
 
         if self.params.basin.style == "global":
             new_system.update_positions(final_configuration, atom_idx=neighbors)

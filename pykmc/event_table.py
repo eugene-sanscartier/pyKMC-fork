@@ -24,8 +24,9 @@ from .result import (
     ShapeID,
     SaddleID,
 )
-from .point_set_registration import simple_ira, check_match
+from .point_set_registration import simple_ira, check_match, cut_cluster
 from .utils.geometry import compute_delr_max, minimum_image_distance, unwrap_around
+from .utils.io_utils import write_pickle
 from .shape_table import ShapeTable
 from . import log
 
@@ -50,7 +51,7 @@ class ReferenceEventTable:
         self.shapes = ShapeTable(params)
 
     def add_events(
-        self, events: list[EventSearchOutput], dispatched_shapes: list[ShapeID]
+        self, events: list[EventSearchOutput], dispatched_shapes: list[ShapeID], live_shapes: dict[int, ShapeID]
     ) -> Result[pd.DataFrame, ErrorInfo]:
         """Events events to the table dataframe.
 
@@ -61,6 +62,8 @@ class ReferenceEventTable:
         dispatched_shapes : list[ShapeID]
             The shape each event's own search was dispatched for, same
             length/order as `events` -- see `_record_knowledge_from_result`.
+        live_shapes : dict[int, ShapeID]
+            The live shape of every non-crystal atom the searches started from.
 
         Returns
         -------
@@ -78,6 +81,7 @@ class ReferenceEventTable:
                 move_atom_idx=ev.move_atom_index,
                 dE_forward=ev.dE_forward,
                 dE_backward=ev.dE_backward,
+                live_shapes=live_shapes,
             )
             results_is_valid_events.append(res)
             if res.is_ok():
@@ -174,6 +178,7 @@ class ReferenceEventTable:
         move_atom_idx: int,
         dE_forward: float,
         dE_backward: float,
+        live_shapes: dict[int, ShapeID] | None = None,
     ) -> Result[pd.DataFrame, ErrorInfo]:
         """Check if the event has the required conditions to be added to the table DataFrame based on the configuration's parameters.
 
@@ -191,6 +196,8 @@ class ReferenceEventTable:
             Energy barrier of the foward event.
         dE_backward : float
             Energy barrier of the backward event.
+        live_shapes : dict[int, ShapeID] | None
+            The live shape of every non-crystal atom the search started from.
 
         Returns
         -------
@@ -261,6 +268,7 @@ class ReferenceEventTable:
                 index_move=move_atom_idx,
                 dE_forward=dE_forward,
                 dE_backward=dE_backward,
+                live_shapes=live_shapes,
             )
 
             if dfevent_forward["id_initial"] == dfevent_forward["id_final"]:
@@ -366,7 +374,7 @@ class ReferenceEventTable:
             return True, None
 
         # dfevent's saddle shape was already resolved into a sid_saddle by
-        # _build_event_series() (via resolve_sid("saddle", ...)) before this method
+        # _build_event_series() (via ShapeTable.resolve("saddle", ...)) before this method
         # was ever called -- reuse that instead of re-deriving it with a
         # second IRA pass over every row in subset.
         matches = self.rows_with_shape(
@@ -474,6 +482,7 @@ class ReferenceEventTable:
         index_move: int,
         dE_forward: float,
         dE_backward: float,
+        live_shapes: dict[int, ShapeID] | None = None,
     ) -> tuple[pd.Series, pd.Series]:
         """Build foward and backward events Series.
 
@@ -491,6 +500,8 @@ class ReferenceEventTable:
             Energy barrier of the foward event.
         dE_backward : float
             Energy barrier of the backward event.
+        live_shapes : dict[int, ShapeID] | None
+            The live shape of every non-crystal atom the search started from.
 
         Returns
         -------
@@ -512,7 +523,7 @@ class ReferenceEventTable:
         id_min1, min1neighbors_list = compute_atomic_environment_id(
             min1, index_move, self.params
         )
-        id_saddle, _saddleneighbors_list = compute_atomic_environment_id(
+        id_saddle, saddleneighbors_list = compute_atomic_environment_id(
             saddle, index_move, self.params
         )
         id_min2, min2neighbors_list = compute_atomic_environment_id(
@@ -562,30 +573,17 @@ class ReferenceEventTable:
         move_atom_idx_forward = np.where(neighbor_list_forward == index_move)[0][0]
         move_atom_idx_backward = np.where(neighbor_list_backward == index_move)[0][0]
 
-        # Decorate id_initial/id_saddle with a shape id each: both are only
-        # coarse topology hashes and can independently collide, so resolve
-        # which distinct geometry (among those already grouped under that
-        # hash) this event actually belongs to, per id-type. id_final's sid
-        # is not independently resolved: the forward event's final state is
-        # exactly the backward event's initial state (same physical
-        # configuration), so its sid is the one already resolved above.
-        sid_initial_forward = self.shapes.resolve_sid(
-            "initial", id_min1, config_min1_forward, move_atom_idx=move_atom_idx_forward
+        # Each minimum and the saddle resolved through its own cluster around the moving atom. A search
+        # starts from the live state, so each minimum is also tried as its moving atom's live shape, and
+        # the saddle as one both its minima already reach, then as one either reaches.
+        live_shape = [live_shapes[index_move]] if live_shapes and index_move in live_shapes else []
+        shape_min1 = self.shapes.resolve("minimum", id_min1, cut_cluster(min1, min1neighbors_list, index_move, self.params), also=live_shape)
+        shape_min2 = self.shapes.resolve("minimum", id_min2, cut_cluster(min2, min2neighbors_list, index_move, self.params), also=live_shape)
+        reached1, reached2 = (
+            {SaddleID(topo_id, int(sid)) for topo_id, sid in zip(rows["id_saddle"], rows["sid_saddle"])}
+            for rows in (self.rows_with_shape(self.table, "id_initial", "sid_initial", shape) for shape in (shape_min1, shape_min2))
         )
-        sid_initial_backward = self.shapes.resolve_sid(
-            "initial", id_min2, config_min2_backward, move_atom_idx=move_atom_idx_backward
-        )
-        # config_saddle_forward/config_saddle_backward are two different
-        # neighbor-list views of the exact same physical saddle point (both
-        # sliced from the one `saddle` Configuration) -- resolved once and
-        # shared between both directions, rather than independently per
-        # direction, so the same saddle can never be split into two distinct
-        # SaddleIDs by an imperfect geometric match between its two views.
-        sid_saddle = self.shapes.resolve_sid(
-            "saddle", id_saddle, config_saddle_forward, move_atom_idx=move_atom_idx_forward
-        )
-        sid_final_forward = sid_initial_backward
-        sid_final_backward = sid_initial_forward
+        shape_saddle = self.shapes.resolve("saddle", id_saddle, cut_cluster(saddle, saddleneighbors_list, index_move, self.params), also=list(reached1 & reached2), fallback=list(reached1 | reached2))
 
         # Symmetries : colour-aware detection only in full coloring mode.
         sym_matrix, sym_perm = unique_symmetries(
@@ -613,13 +611,13 @@ class ReferenceEventTable:
                 "dE_forward": dE_forward,
                 "dE_backward": dE_backward,
                 "k": compute_rate_Eyring(dE_forward, self.params),
-                "event_id": combine_ids(id_min1, id_saddle, id_min2),
-                "id_initial": id_min1,
-                "sid_initial": sid_initial_forward,
-                "id_saddle": id_saddle,
-                "sid_saddle": sid_saddle,
-                "id_final": id_min2,
-                "sid_final": sid_final_forward,
+                "event_id": combine_ids(shape_min1.id, shape_saddle.id, shape_min2.id),
+                "id_initial": shape_min1.id,
+                "sid_initial": shape_min1.sid,
+                "id_saddle": shape_saddle.id,
+                "sid_saddle": shape_saddle.sid,
+                "id_final": shape_min2.id,
+                "sid_final": shape_min2.sid,
                 "move_atom_idx": move_atom_idx_forward,
                 "sym_matrix": sym_matrix,
                 "sym_perm": sym_perm,
@@ -640,13 +638,13 @@ class ReferenceEventTable:
                 "dE_forward": dE_backward,
                 "dE_backward": dE_forward,
                 "k": compute_rate_Eyring(dE_backward, self.params),
-                "event_id": combine_ids(id_min2, id_saddle, id_min1),
-                "id_initial": id_min2,
-                "sid_initial": sid_initial_backward,
-                "id_saddle": id_saddle,
-                "sid_saddle": sid_saddle,
-                "id_final": id_min1,
-                "sid_final": sid_final_backward,
+                "event_id": combine_ids(shape_min2.id, shape_saddle.id, shape_min1.id),
+                "id_initial": shape_min2.id,
+                "sid_initial": shape_min2.sid,
+                "id_saddle": shape_saddle.id,
+                "sid_saddle": shape_saddle.sid,
+                "id_final": shape_min1.id,
+                "sid_final": shape_min1.sid,
                 "move_atom_idx": move_atom_idx_backward,
                 "sym_matrix": sym_matrix,
                 "sym_perm": sym_perm,
@@ -738,6 +736,38 @@ class ReferenceEventTable:
             shape = ShapeID(row["id_initial"], int(row["sid_initial"]))
             self.shapes.forget(shape, int(row["idx_ref"]))
 
+    def fuse(self) -> int:
+        """Run the queued fusions, filing each fused minimum's events under its survivor; returns how many were fused."""
+        fused = 0
+        for shape, into in self.shapes.fusions():
+            # Each transition leaving `shape` is taken out with its reverse and filed under `into`; one `into` already has is dropped.
+            renamed = {}
+            for idx_ref in self.rows_with_shape(self.table, "id_initial", "sid_initial", shape)["idx_ref"].astype(int).tolist():
+                forward = self.table.loc[self.table["idx_ref"] == idx_ref]
+                if forward.empty:
+                    continue
+                pair_refs = {idx_ref, int(forward.iloc[0]["idx_backward"])}
+                pair = self.table[self.table["idx_ref"].isin(pair_refs)].copy()
+                self.table = self.table[~self.table["idx_ref"].isin(pair_refs)].reset_index(drop=True)
+
+                for side in ("initial", "final"):
+                    at_shape = (pair[f"id_{side}"] == shape.id) & (pair[f"sid_{side}"] == shape.sid)
+                    pair.loc[at_shape, f"id_{side}"] = into.id
+                    pair.loc[at_shape, f"sid_{side}"] = into.sid
+                pair["event_id"] = [combine_ids(*ids) for ids in zip(pair["id_initial"], pair["id_saddle"], pair["id_final"])]
+
+                forward = pair[pair["idx_ref"] == idx_ref].iloc[0]
+                is_new, matched = self.is_new_event(forward)
+                if is_new:
+                    self.table = pd.concat([self.table, pair], ignore_index=True)
+                    continue
+                renamed[idx_ref] = matched
+                renamed[int(forward["idx_backward"])] = int(self.table.loc[self.table["idx_ref"] == matched, "idx_backward"].iloc[0])
+
+            self.shapes.retire(shape, into, renamed)
+            fused += 1
+        return fused
+
     def save(self, outfile: str = "reference_table.pickle") -> None:
         """Save the reference event table to a pickle file.
 
@@ -752,7 +782,7 @@ class ReferenceEventTable:
             path to the output file, by default 'reference_table.pickle'.
 
         """
-        self.table.to_pickle(outfile)
+        write_pickle(self.table, outfile)
         self.shapes.save()
 
 
@@ -1069,4 +1099,4 @@ class ActiveEventTable:
             path to the output file, by default 'active_table.pickle'.
 
         """
-        self.table.to_pickle(outfile)
+        write_pickle(self.table, outfile)

@@ -62,6 +62,7 @@ class NeighborsList:
         positions = self.system.positions
         box = [self.system.cell[0][0], self.system.cell[1][1], self.system.cell[2][2]]
         tree = cKDTree(positions, boxsize=box)
+        self.tree = tree
         box_arr = np.array(box)
         query_rnei = (
             max(self.rnei, *self.rnei_pairs.values()) if self.rnei_pairs else self.rnei
@@ -117,6 +118,11 @@ class NeighborsList:
 
         """
         return self.neighbors_list[cutoff_type][idx]
+
+    def ball(self, idx: int, radius: float) -> list[int]:
+        """The atoms within `radius` of atom `idx`, itself included, in ascending order."""
+        atoms = sorted(self.tree.query_ball_point(self.system.positions[idx], radius))
+        return atoms
 
     def update_neighbors(self, list_atoms: np.ndarray) -> None:
         """Update placeholder for future implementation.

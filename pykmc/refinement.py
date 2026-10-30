@@ -10,14 +10,13 @@ from .result import (
     ErrorType,
     Err,
     Ok,
-    PSROutput,
     RefinementCandidate,
     RefinementTask,
     geometry_error,
 )
 from .log import fmt_distance
 from .utils.geometry import compute_delr_max
-from .point_set_registration import PointSetRegistration, check_match
+from .point_set_registration import Alignment, PointSetRegistration
 from .utils import geometry
 from .parameters import Parameters
 from .system import System, Configuration
@@ -74,7 +73,7 @@ class Refinement:
         self.tasks = []
         # How many saddle searches each task has cost, counting its retries.
         self.attempts = []
-        self._psr_cache: dict[tuple[int, int], Result[PSROutput, ErrorInfo]] = {}
+        self._psr_cache: dict[tuple[int, int], Result[Alignment, ErrorInfo]] = {}
 
     def execute(self, candidates: list[RefinementCandidate]) -> None:
         """Execute event refinements for each already-selected candidate.
@@ -172,12 +171,9 @@ class Refinement:
         # sibling task of the same (atom, row) pair reuses the same match.
         psr_key = (at_idx, num_reference_event)
         if psr_key not in self._psr_cache:
-            result_psr = PointSetRegistration(
+            self._psr_cache[psr_key] = PointSetRegistration(
                 self.params, self.system, dfevent, self.neighbors_list, at_idx
-            ).match()
-            self._psr_cache[psr_key] = check_match(
-                result_psr, matching_score_thr
-            )
+            ).match(matching_score_thr)
         result_psr = self._psr_cache[psr_key]
         if not result_psr.is_ok():
             return PreparedRefinementTask(
@@ -188,7 +184,7 @@ class Refinement:
                 immediate_result=result_psr,
             )
 
-        output_psr = result_psr.ok_value()
+        alignment = result_psr.ok_value()
         initial_configuration = dfevent.at["initial_configuration"]
         displacement_saddle = dfevent.at["saddle_configuration"] - initial_configuration
         displacement_final = dfevent.at["final_configuration"] - initial_configuration
@@ -209,18 +205,8 @@ class Refinement:
         saddle_configuration = initial_configuration + new_displacement_saddle
         final_configuration = initial_configuration + new_displacement_final
 
-        new_saddle_configuration = geometry.transform_positions(
-            saddle_configuration,
-            output_psr.rotation_matrix,
-            output_psr.translation_matrix,
-            output_psr.permutation_matrix,
-        )
-        new_final_configuration = geometry.transform_positions(
-            final_configuration,
-            output_psr.rotation_matrix,
-            output_psr.translation_matrix,
-            output_psr.permutation_matrix,
-        )
+        new_saddle_configuration = alignment.place(saddle_configuration, neighbors)
+        new_final_configuration = alignment.place(final_configuration, neighbors)
         min2_configuration = new_final_configuration.with_types(
             np.asarray(self.system.types)[neighbors]
         )

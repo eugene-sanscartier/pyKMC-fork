@@ -1,6 +1,6 @@
-import os
-
 import pandas as pd
+
+from ..utils.io_utils import write_pickle
 
 # TODO: See if separated StatesConnectivity and BasinsStateConnectivity is really usefull.
 # TODO: See if self.gaph is needed, if only used for analysis we can remove it.
@@ -242,9 +242,7 @@ class StatesConnectivity:
         outfile : str, optional
             Output filename. Default is 'basin_connectivity.pickle'.
         """
-        partial = outfile + ".partial"
-        self.df.to_pickle(partial)
-        os.replace(partial, outfile)
+        write_pickle(self.df, outfile)
 
     def clear(self):
         """Reset the connectivity table to an empty DataFrame."""

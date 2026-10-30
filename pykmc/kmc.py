@@ -40,8 +40,8 @@ from ase.io import write
 from ase import Atoms
 from .algorithms import rejection_free
 import sys
+import traceback
 import pandas as pd
-import pickle
 from .initializer import Initializer
 from .info_simulation import (
     info_atomic_environments,
@@ -57,6 +57,7 @@ from .refinement import Refinement
 from .otfml import OTFMLController, OTFMLStreamCheckpoint
 import time
 from .utils import push_towards, compute_delr_max
+from .utils.io_utils import write_pickle
 from .basins.detection import DetectorThreshold
 from .basins import BasinsGenericEvents
 from .event_recycling import DistanceRecycling, Recycling
@@ -116,6 +117,7 @@ class KMC:
         self.potential_energy = None
         self.active_table: ActiveEventTable | None = None
         self._pre_exec_configuration: Configuration | None = None
+        self.step_info: KMCLoopInfo | None = None
         self.bias: Bias | None = None
         self.otfml = OTFMLController(self)
         self.recycler: Recycling | None = None
@@ -127,6 +129,15 @@ class KMC:
                 )
 
     def run(self) -> None:
+        """Run the simulation, writing the catalogue and the unfinished step's log record if an exception stops it."""
+        try:
+            self._run_steps()
+        except Exception:
+            log.error(f"Run stopped by an exception:\n{traceback.format_exc()}")
+            self._checkpoint()
+            raise
+
+    def _run_steps(self) -> None:
         """Run the simulation."""
         # Initialize the simulation, KMC attributes and minimize the system
         # self._initialize()
@@ -210,6 +221,7 @@ class KMC:
             start_cpu = time.process_time()
 
             log.header(f"Step : {step}")
+            self.step_info = KMCLoopInfo(step=step)
 
             # == Find Current atomic environments that has not been visited ==
             new_shapes, atom_shapes = self.resolve_new_shapes()
@@ -226,7 +238,7 @@ class KMC:
                     all_search_results_for_info,
                     results_is_valid_events,
                     shape_search_stats,
-                ) = self.adaptive_event_search(new_shapes)
+                ) = self.adaptive_event_search(new_shapes, atom_shapes)
             else:
                 ##=>List of atoms(central) on which we gonna perfom an event search
                 central_atom_research_list, dispatched_shapes = self.central_atoms_research(
@@ -252,7 +264,7 @@ class KMC:
                         if r.move_atom_index not in inactive_set
                     ]
                 search_result_shapes = [shape_by_atom[r.central_atom_index] for r in search_results]
-                results_is_valid_events = self.add_reference_events(search_results, search_result_shapes)
+                results_is_valid_events = self.add_reference_events(search_results, search_result_shapes, atom_shapes)
                 shape_search_stats = None
                 all_search_results_for_info = event_search.results
                 # No Good-Turing estimate here, so no continuous credit
@@ -266,6 +278,37 @@ class KMC:
                         self.reference_table.shapes.record_search_failure(shape)
                     self.reference_table.shapes.mark_shape_completed(shape)
 
+            # == FUSE THE MINIMA FOUND TO BE ONE SHAPE ==
+            ##=>Each found transition's two minima, read before fusion renames them
+            shapes = self.reference_table.shapes
+            found = [(output.move_atom_index, self.reference_table.resolve_forward_and_backward_rows(result)) for output, result in zip(search_results, results_is_valid_events)]
+            found = [(atom, [ShapeID(row["id_initial"], int(row["sid_initial"])) for row in rows]) for atom, rows in found if rows is not None]
+            fused = self.reference_table.fuse()
+            if fused:
+                log.info(f"{fused} shapes fused", depth=1)
+            for atom, shape in atom_shapes.items():
+                atom_shapes[atom] = shapes.canonical(shape)
+            not_live = sum(atom_shapes.get(atom) not in [shapes.canonical(side) for side in sides] for atom, sides in found)
+            if not_live:
+                log.info(f"{not_live} of {len(found)} found transitions not live", depth=1)
+
+            # == Update variables ==
+            l_ids = list(set(self.atomic_environment.atomic_environment_list))
+            self.visited_environments.update(
+                set(l_ids).difference(self.visited_environments)
+            )
+            self.step_info.atomic_environment_info = self.get_info_atomic_environments(new_shapes)
+            self.step_info.reference_event_searches_info = self.get_info_reference_event_searches(all_search_results_for_info)
+            self.step_info.valid_event_info = self.get_info_is_valid_reference_events(results_is_valid_events)
+            self.step_info.adaptive_search_info = self.get_info_adaptive_search(shape_search_stats)
+            n_capped = self.step_info.adaptive_search_info.n_capped if self.step_info.adaptive_search_info is not None else 0
+            if n_capped > 0:
+                log.warning(
+                    f"{n_capped} topolog{'y' if n_capped == 1 else 'ies'} hit the adaptive search ceiling "
+                    "without converging; may still have undiscovered events."
+                )
+            self._save()
+
             ##=>Close simulation if no events in the reference table
             if len(self.reference_table.table) == 0:
                 log.error(
@@ -273,17 +316,13 @@ class KMC:
                 )
                 self._close()
 
-            # == Update variables ==
-            l_ids = list(set(self.atomic_environment.atomic_environment_list))
-            self.visited_environments.update(
-                set(l_ids).difference(self.visited_environments)
-            )
             # == Refinement ==
             ##=>Refines all selected candidates (skipping (atom, ref_event) pairs already carried over)
             refinement = self.execute_refinements(
                 existing_pairs=self.active_table.existing_pairs(),
                 atom_shapes=atom_shapes,
             )
+            self.step_info.refinements_info = self.get_info_refinements(refinement.results)
 
             # The persistent self.active_table was extended in place; recycled
             # rows from the previous step are already present.
@@ -321,6 +360,7 @@ class KMC:
                 self.visited_environments = self.visited_environments.difference(
                     set(err_ae) - {selected_topo}
                 )
+                self._save()
             # INFO :
             self.loggers.events_file_step_first_line("events", step)
             self.loggers.events_applicable_info_line("events", idx_selected_display)
@@ -449,32 +489,7 @@ class KMC:
             ##=>Minimize
 
             # == Log informations ==
-            atomic_environment_info = self.get_info_atomic_environments(
-                new_shapes
-            )
-            reference_event_searches_info = self.get_info_reference_event_searches(
-                all_search_results_for_info
-            )
-            is_valid_events_info = self.get_info_is_valid_reference_events(
-                results_is_valid_events
-            )
-            refinements_info = self.get_info_refinements(refinement.results)
-            adaptive_search_info = self.get_info_adaptive_search(shape_search_stats)
-            kmc_loop_info = KMCLoopInfo(
-                step=step,
-                atomic_environment_info=atomic_environment_info,
-                reference_event_searches_info=reference_event_searches_info,
-                valid_event_info=is_valid_events_info,
-                refinements_info=refinements_info,
-                adaptive_search_info=adaptive_search_info,
-            )
-            self.loggers.info("info", kmc_loop_info.output_msg())
-            if adaptive_search_info is not None and adaptive_search_info.n_capped > 0:
-                log.warning(
-                    f"{adaptive_search_info.n_capped} topolog"
-                    f"{'y' if adaptive_search_info.n_capped == 1 else 'ies'} hit the adaptive search ceiling "
-                    "without converging; may still have undiscovered events."
-                )
+            self._write_step_info()
 
             elapsed_real = time.time() - start_real
             elapsed_cpu = time.process_time() - start_cpu
@@ -698,7 +713,7 @@ class KMC:
         return event_search
 
     def add_reference_events(
-        self, events: list[EventSearchOutput], dispatched_shapes: list[ShapeID]
+        self, events: list[EventSearchOutput], dispatched_shapes: list[ShapeID], atom_shapes: dict[int, ShapeID]
     ) -> list[pd.DataFrame]:
         """Add events to the reference table.
 
@@ -711,6 +726,8 @@ class KMC:
             length/order as `events` -- lets a rejected event (no catalogued
             owner to attribute it to) still be logged against the shape that
             spent the search on it.
+        atom_shapes : dict[int, ShapeID]
+            Every non-crystal atom's live shape.
 
         Returns
         -------
@@ -718,7 +735,7 @@ class KMC:
             List of event dataframe that has been added to the reference event table.
 
         """
-        results_is_valid_events = self.reference_table.add_events(events, dispatched_shapes)
+        results_is_valid_events = self.reference_table.add_events(events, dispatched_shapes, atom_shapes)
         log.info(
             f"Adding {len([e for e in results_is_valid_events if e.is_ok()])} events to the reference table",
             depth=1,
@@ -726,7 +743,7 @@ class KMC:
         return results_is_valid_events
 
     def adaptive_event_search(
-        self, new_shapes: dict[ShapeID, list[int]]
+        self, new_shapes: dict[ShapeID, list[int]], atom_shapes: dict[int, ShapeID]
     ) -> AdaptiveSearchResult:
         """Count-weighted adaptive event search for a batch of new shapes.
 
@@ -757,6 +774,8 @@ class KMC:
         ----------
         new_shapes : dict[ShapeID, list[int]]
             shape -> eligible atom indices, from `resolve_new_shapes()`.
+        atom_shapes : dict[int, ShapeID]
+            Every non-crystal atom's live shape.
 
         Returns
         -------
@@ -806,22 +825,13 @@ class KMC:
             if inactive_set and output.move_atom_index in inactive_set:
                 return
             all_search_results.append(output)
-            valid_result = self.add_reference_events([output], [shape])[0]
+            valid_result = self.add_reference_events([output], [shape], atom_shapes)[0]
             all_valid_results.append(valid_result)
 
-            # The shape is resolved fresh here (rather than reused from
-            # dispatch time) because add_reference_events, just above, may
-            # have just catalogued this exact atom's sid for the first time.
-            resolved_shape = self.reference_table.shapes.resolve_live_shape(
-                self.system, self.neighbors_list, self.atomic_environment,
-                output.central_atom_index, mint=False,
-            )
-            if resolved_shape is None:
-                return
             resolved = self.reference_table.resolve_forward_and_backward_rows(valid_result)
             if resolved is None:
                 return
-            session.credit(resolved_shape, *resolved)
+            session.credit(shape, *resolved)
 
         def process_result(task, shape):
             result = event_search.results[task.task_id]
@@ -1369,8 +1379,19 @@ class KMC:
         """Save the reference event table and the list of visited environments."""
         self.reference_table.save("reference_table.pickle")
         self.loggers.reference_table_write("reference_table", self.reference_table)
-        with open(self.params.control.visited_environments_output, "wb") as file:
-            pickle.dump(self.visited_environments, file)
+        write_pickle(self.visited_environments, self.params.control.visited_environments_output)
+
+    def _write_step_info(self) -> None:
+        """Write the current step's log record to the info file, once."""
+        if self.step_info is None:
+            return
+        self.loggers.info("info", self.step_info.output_msg())
+        self.step_info = None
+
+    def _checkpoint(self) -> None:
+        """Write the catalogue and the log record of a step that did not finish."""
+        self._save()
+        self._write_step_info()
 
     def _save_restart_file(self, last_step, last_time):
         """
@@ -1383,7 +1404,8 @@ class KMC:
         )
 
     def _close(self) -> None:
-        """Close the simulation."""
+        """Write the catalogue and close the simulation."""
+        self._checkpoint()
         log.info("End of simulation")
         self.manager.close_all()
         sys.exit()

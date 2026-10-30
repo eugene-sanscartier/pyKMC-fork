@@ -1,4 +1,5 @@
 import os
+import pickle
 import threading
 from functools import wraps
 
@@ -69,3 +70,12 @@ class capture_output:
                 return func(*args, **kwargs)
 
         return wrapped
+
+
+def write_pickle(obj, path: str) -> None:
+    """Pickle `obj` to `path` through a hidden partial file beside it, replacing `path` only once fully written."""
+    directory, name = os.path.split(path)
+    partial = os.path.join(directory, f".{name}.partial")
+    with open(partial, "wb") as file:
+        pickle.dump(obj, file, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(partial, path)

@@ -116,6 +116,7 @@ class ErrorType(Enum):
     EXTREME_EXTRAPOLATION = 17
     PSR_NO_MATCH_FOUND = 21
     PSR_MATCHING_SCORE_ABOVE_ACCEPTANCE_THRESHOLD = 22
+    PSR_ATOM_COUNT_MISMATCH = 23
     REFINEMENT_INVALID_MINIMA = 32
     # An achieved geometry did not reproduce the one predicted for it. Carries
     # `stage` -- "saddle", "min1" or "min2" -- with the measured `delr` and the
@@ -161,7 +162,7 @@ class ShapeID(NamedTuple):
     graph-hash pre-filter -- it can collide across genuinely different local
     neighborhoods. `sid` (e.g. `sid_initial`/`sid_saddle`/`sid_final`)
     disambiguates that collision via IRA/PSR geometric matching among
-    representatives sharing the same `id` (see `ReferenceEventTable._resolve_sid`).
+    representatives sharing the same `id` (see `ShapeTable.resolve`).
     Neither is meaningful alone: `sid` is only defined relative to its own
     `id`, and `id` alone can conflate distinct geometries. Comparing or
     keying on `id` without `sid` reopens that collision bug -- this type

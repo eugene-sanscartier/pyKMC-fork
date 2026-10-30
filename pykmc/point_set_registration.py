@@ -1,13 +1,16 @@
 """Manages Point Set Registration (shape matching) methods."""
 
+from dataclasses import dataclass
+
 from .utils.io_utils import capture_output
 import ira_mod
+import numpy as np
 from .result import Result, ErrorInfo, PSROutput, Ok, Err, ErrorType
 from .parameters import Parameters
 from .system import System, Configuration
 import pandas as pd
 from .neighbors_list import NeighborsList
-from .utils.geometry import unwrap_around
+from .utils.geometry import unwrap_around, wrap_configuration
 
 
 class PointSetRegistration:
@@ -43,59 +46,113 @@ class PointSetRegistration:
         self.central_atom_index = central_atom_index
         self.psr_style = self.params.psr.style
 
-    def match(self) -> Result[PSROutput, ErrorInfo]:
-        """Run the point set registration based on the style defined in the configuration.
-
-        Returns
-        -------
-        Result[PSROutput, ErrorInfo]
-            Results of the point set registration.
-
-        Raises
-        ------
-        Exception
-            If the style in not known.
-
-        """
+    def match(self, thr: float) -> Result[Alignment, ErrorInfo]:
+        """Match the event's initial geometry into the central atom's cluster within `thr`, with the configured style."""
         match self.psr_style:
             case "ira":
-                return self.ira(self.central_atom_index)
+                return self.ira(self.central_atom_index, thr)
             case _:
                 raise Exception("Point set registration style unknown")
 
-    def ira(self, central_atom_index: int) -> Result[PSROutput, ErrorInfo]:
-        """Use IRA to extract rotation, translation, permutation matrix to apply on generic event.
+    def ira(self, central_atom_index: int, thr: float) -> Result[Alignment, ErrorInfo]:
+        """Match the event's initial geometry into `central_atom_index`'s cluster with IRA, within `thr`."""
+        cluster = cut_cluster(self.system.configuration, self.neighbors_list, central_atom_index, self.params)
+        alignment = align(self.dfevent.at["initial_configuration"], int(self.dfevent.at["move_atom_idx"]), cluster, self.params, thr)
+        return alignment
 
-        Parameters
-        ----------
-        central_atom_index : int
-           index of the system's central atom
 
-        Returns
-        -------
-        Result[PSROutput, ErrorInfo]
-            The results of the ira psr procedure.
+@dataclass
+class Cluster:
+    """One atom's neighbourhood as matched against a catalogued geometry.
 
-        """
-        initial_configuration = self.dfevent.at["initial_configuration"]
+    Attributes
+    ----------
+    configuration : Configuration
+        The atoms within `rcut` + `accept_thr` of the centre, unwrapped around it.
+    atoms : list[int]
+        The system atom of each row.
+    center : int
+        The row of the centre.
 
-        # atoms around the central atom, exactly rcut (see docstring)
-        neighbor_list = self.neighbors_list.get_neighbors(
-            "rcut", central_atom_index
-        ).copy()
-        live_configuration = unwrap_around(
-            self.system.configuration[neighbor_list],
-            self.system.positions[central_atom_index],
-        )
+    """
 
-        return simple_ira(
-            live_configuration,
-            initial_configuration,
-            self.params.ira.kmax_factor,
-            full=self.params.atomicenvironment.coloring_mode == "full",
-            candidate1=neighbor_list.index(central_atom_index),
-            candidate2=int(self.dfevent.at["move_atom_idx"]),
-        )
+    configuration: Configuration
+    atoms: list[int]
+    center: int
+
+
+@dataclass
+class Alignment:
+    """A catalogued geometry matched into a `Cluster`.
+
+    Attributes
+    ----------
+    cluster : Cluster
+        The cluster matched into.
+    psr : PSROutput
+        The transform carrying `cluster` onto the catalogued geometry.
+    partners : np.ndarray of int
+        The row of `cluster` matched to each row of the catalogued geometry.
+
+    """
+
+    cluster: Cluster
+    psr: PSROutput
+    partners: np.ndarray
+
+    def place(self, configuration: Configuration, atoms: list[int]) -> Configuration:
+        """`configuration`, in the catalogued geometry's frame and rows, carried onto the system atoms `atoms`; an atom with no partner keeps its place."""
+        positions = self.cluster.configuration.positions.copy()
+        positions[self.partners] = (configuration.positions - self.psr.translation_matrix) @ self.psr.rotation_matrix
+
+        rows = {atom: row for row, atom in enumerate(self.cluster.atoms)}
+        selected = [rows[atom] for atom in atoms]
+        placed = wrap_configuration(Configuration(types=np.asarray(self.cluster.configuration.types)[selected], positions=positions[selected], cell=self.cluster.configuration.cell))
+        return placed
+
+
+def cut_cluster(configuration: Configuration, neighbors_list: NeighborsList, center_atom: int, params: Parameters) -> Cluster:
+    """`center_atom`'s atoms within `rcut` + `accept_thr` in `configuration`, unwrapped around it."""
+    atoms = neighbors_list.ball(center_atom, params.atomicenvironment.rcut + params.psr.accept_thr)
+    cluster = Cluster(configuration=unwrap_around(configuration[atoms], configuration.positions[center_atom]), atoms=atoms, center=atoms.index(center_atom))
+    return cluster
+
+
+def align(reference: Configuration, reference_center: int, cluster: Cluster, params: Parameters, thr: float) -> Result[Alignment, ErrorInfo]:
+    """Match `reference` into `cluster` within `thr`, leaving no cluster atom closer than `rcut` - `accept_thr` to its centre unmatched.
+
+    Parameters
+    ----------
+    reference : Configuration
+        The catalogued geometry, cut at `rcut`.
+    reference_center : int
+        The row of `reference` holding its centre.
+    cluster : Cluster
+        The geometry matched into.
+    params : Parameters
+        The run's configuration.
+    thr : float
+        The largest score accepted.
+
+    Returns
+    -------
+    Result[Alignment, ErrorInfo]
+        The match, or why there is none.
+
+    """
+    full = params.atomicenvironment.coloring_mode == "full"
+    result = check_match(simple_ira(reference, cluster.configuration, params.ira.kmax_factor, full=full, candidate1=reference_center, candidate2=cluster.center), thr)
+    if not result.is_ok():
+        return result
+
+    psr = result.ok_value()
+    partners = psr.permutation_matrix[: len(reference)]
+    unmatched = psr.permutation_matrix[len(reference):]
+    radii = np.linalg.norm(cluster.configuration.positions[unmatched] - cluster.configuration.positions[cluster.center], axis=1)
+    inner = params.atomicenvironment.rcut - params.psr.accept_thr
+    if (radii < inner).any():
+        return Err(ErrorInfo(type=ErrorType.PSR_ATOM_COUNT_MISMATCH, message="Cluster atom inside rcut left unmatched", details=f"unmatched atom at {radii.min():.3f} A, inside {inner:.3f} A"))
+    return Ok(Alignment(cluster=cluster, psr=psr, partners=partners))
 
 
 def check_match(
@@ -153,13 +210,16 @@ def simple_ira(
     candidate1: int | None = None,
     candidate2: int | None = None,
 ) -> Result[PSROutput, ErrorInfo]:
-    """Run IRA between two `Configuration`s; `full` gates real vs. dummy ("X") types.
+    """Match `configuration_1` into `configuration_2` with IRA, scoring `configuration_1`'s atoms only; `full` gates real vs. dummy ("X") types.
 
+    `configuration_2` may hold more atoms, left unmatched past `len(configuration_1)` in the permutation.
     `candidate1`/`candidate2`, if given, seed the search with a known
     matching atom pair (e.g. each configuration's central atom).
     """
     nat1 = len(configuration_1)
     nat2 = len(configuration_2)
+    if nat1 > nat2:
+        return Err(ErrorInfo(type=ErrorType.PSR_ATOM_COUNT_MISMATCH, message="First configuration larger than the second", details=f"{nat1} atoms into {nat2}"))
     typ1 = list(configuration_1.types) if full else nat1 * ["X"]
     typ2 = list(configuration_2.types) if full else nat2 * ["X"]
     candidate_kwargs = {"candidate1": candidate1, "candidate2": candidate2} if candidate1 is not None else {}
