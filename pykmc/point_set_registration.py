@@ -1,5 +1,7 @@
 """Manages Point Set Registration (shape matching) methods."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 from .utils.io_utils import capture_output
